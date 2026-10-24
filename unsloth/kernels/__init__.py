@@ -1,11 +1,8 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -42,8 +39,19 @@ from .fast_lora import (
     apply_lora_mlp_geglu_approx,
     apply_lora_qkv,
     apply_lora_o,
+    fast_lora_forward,
 )
-from .utils import fast_dequantize, fast_gemv, QUANT_STATE, fast_linear_forward, matmul_lora
+from .fp8 import *  # Patch FbgmemFP8Linear/FP8Linear forwards before model creation, so compiled non-fast-inference
+
+# models are covered too
+from .nvfp4 import *
+from .utils import (
+    fast_dequantize,
+    fast_gemv,
+    QUANT_STATE,
+    fast_linear_forward,
+    matmul_lora,
+)
 
 from .flex_attention import (
     HAS_FLEX_ATTENTION,
@@ -54,11 +62,10 @@ from .flex_attention import (
 )
 
 import os
+
 if "UNSLOTH_ZOO_IS_PRESENT" not in os.environ:
     try:
         print("🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.")
     except:
         print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
-    pass
-pass
 del os

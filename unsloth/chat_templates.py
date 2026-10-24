@@ -1,11 +1,8 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,35 +17,87 @@ __all__ = [
 
     "to_sharegpt",
     "standardize_sharegpt",
+    "standardize_data_formats",
     "apply_chat_template",
     "train_on_responses_only",
 
     "test_construct_chat_template",
 ]
 
-from transformers import StoppingCriteria, StoppingCriteriaList
-from torch import LongTensor, FloatTensor
-from transformers.models.llama.modeling_llama import logger
-from .save import patch_saving_functions
+from transformers import ProcessorMixin
+
+from transformers.utils import logging
+try:
+    from torch import LongTensor, FloatTensor
+except ImportError:
+    LongTensor = FloatTensor = None
+logger = logging.get_logger(__name__)
 import os
 import shutil
-from .tokenizer_utils import *
-from .models._utils import patch_tokenizer
 import re
-from unsloth_zoo.dataset_utils import (
-    train_on_responses_only,
-)
+from .ollama_template_mappers import OLLAMA_TEMPLATES
+from .tokenizers_v1 import enable_tokenizers_v1
+try:
+    from unsloth_zoo.dataset_utils import (
+        train_on_responses_only as _zoo_train_on_responses_only,
+        standardize_data_formats,
+    )
+except ImportError:
+    # dataset_utils pulls torch; keep chat_templates importable on torch-free (MLX) hosts, which expose
+    # these via the backend-specific wrappers.
+    _zoo_train_on_responses_only = standardize_data_formats = None
+
+if _zoo_train_on_responses_only is None:
+    train_on_responses_only = None
+else:
+    import functools as _functools
+    import inspect as _inspect
+
+    _ZOO_RESPONSES_ONLY_SIGNATURE = _inspect.signature(_zoo_train_on_responses_only)
+
+    @_functools.wraps(_zoo_train_on_responses_only)
+    def train_on_responses_only(*args, **kwargs):
+        # The zoo auto-sizes its dataset.map() workers with the uncapped min(max(cpu_count + 4, 2), 64)
+        # heuristic (#2693) and is a separate package, so bound the count on the way in; see
+        # resolve_responses_only_num_proc. Top level, not under unsloth.utils, whose __init__ imports
+        # torch: this path has to stay MLX-safe.
+        try:
+            from unsloth_zoo.dataset_num_proc import resolve_responses_only_num_proc
+        except ImportError:
+            from .dataset_num_proc import resolve_responses_only_num_proc
+
+        try:
+            bound = _ZOO_RESPONSES_ONLY_SIGNATURE.bind_partial(*args, **kwargs)
+        except TypeError:
+            # Signature drift, or a bad call: let the zoo raise its own error.
+            return _zoo_train_on_responses_only(*args, **kwargs)
+
+        # The zoo returns the masking closure before reading num_proc.
+        if bound.arguments.get("return_function", False):
+            return _zoo_train_on_responses_only(*args, **kwargs)
+
+        arguments = dict(bound.arguments)
+        arguments["num_proc"] = resolve_responses_only_num_proc(
+            arguments.get("trainer"),
+            arguments.get("num_proc"),
+        )
+        trainer = arguments.pop("trainer", None)
+        return _zoo_train_on_responses_only(trainer, **arguments)
+
+standardize_sharegpt = standardize_data_formats
 CHAT_TEMPLATES = {}
+DEFAULT_SYSTEM_MESSAGE = {}
+def _ollama_template(name: str):
+    return OLLAMA_TEMPLATES[name]
 
 # =========================================== Unsloth
-# Unsloth efficient template leverages from Zephyr
 unsloth_template = \
     "{{ bos_token }}"\
     "{% if messages[0]['role'] == 'system' %}"\
         "{{ messages[0]['content'] + '\n' }}"\
         "{% set loop_messages = messages[1:] %}"\
     "{% else %}"\
-        "{{ 'You are a helpful assistant to the user\n' }}"\
+        "{{ '{system_message}' + '\n' }}"\
         "{% set loop_messages = messages %}"\
     "{% endif %}"\
     "{% for message in loop_messages %}"\
@@ -63,27 +112,15 @@ unsloth_template = \
     "{% if add_generation_prompt %}"\
         "{{ '>>> Assistant: ' }}"\
     "{% endif %}"
-pass
 
-unsloth_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}{{ .System }}
-{{ end }}{{ if .Prompt }}>>> User: {{ .Prompt }}
-{{ end }}>>> Assistant: {{ .Response }}{__EOS_TOKEN__}
-"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-SYSTEM """You are a helpful assistant to the user"""
-'''
+unsloth_ollama = _ollama_template("unsloth")
 
 unsloth_eos_token = "eos_token"
 CHAT_TEMPLATES["unsloth"] = (unsloth_template, unsloth_eos_token, False, unsloth_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["unsloth"] = "You are a helpful assistant to the user"
 
-# =========================================== Zephyr
 # Zephyr has no BOS!
+# =========================================== Zephyr
 zephyr_template = \
     "{% for message in messages %}"\
         "{% if message['role'] == 'user' %}"\
@@ -97,29 +134,15 @@ zephyr_template = \
     "{% if add_generation_prompt %}"\
         "{{ '<|assistant|>\n' }}"\
     "{% endif %}"
-pass
 
-zephyr_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}<|system|>
-{{ .System }}{__EOS_TOKEN__}
-{{ end }}{{ if .Prompt }}<|user|>
-{{ .Prompt }}{__EOS_TOKEN__}
-{{ end }}<|assistant|>
-{{ .Response }}{__EOS_TOKEN__}
-"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+zephyr_ollama = _ollama_template("zephyr")
 
 zephyr_eos_token = "eos_token"
 CHAT_TEMPLATES["zephyr"] = (zephyr_template, zephyr_eos_token, False, zephyr_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["zephyr"] = None
 
+# ChatML has no BOS and no EOS: <|im_start|> / <|im_end|> act as BOS / EOS.
 # =========================================== ChatML
-# ChatML has no BOS and not EOS! Rather <|im_start|> and <|im_end|> acts as BOS / EOS.
 chatml_template = \
     "{% for message in messages %}"\
         "{% if message['role'] == 'user' %}"\
@@ -133,30 +156,15 @@ chatml_template = \
     "{% if add_generation_prompt %}"\
         "{{ '<|im_start|>assistant\n' }}"\
     "{% endif %}"
-pass
 
-chatml_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}{{ if .Prompt }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-{{ end }}<|im_start|>assistant
-{{ .Response }}<|im_end|>
-"""
-PARAMETER stop "<|im_start|>"
-PARAMETER stop "<|im_end|>"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+chatml_ollama = _ollama_template("chatml")
 
 chatml_eos_token = "<|im_end|>"
 CHAT_TEMPLATES["chatml"] = (chatml_template, chatml_eos_token, True, chatml_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["chatml"] = None
 
-# =========================================== Mistral-1
 # Mistral Instruct doesn't allow system prompts, so we append it to the user message.
+# =========================================== Mistral-1
 mistral_template = \
     "{{ bos_token }}"\
     "{% if messages[0]['role'] == 'system' %}"\
@@ -179,24 +187,16 @@ mistral_template = \
             "{{ raise_exception('Only user and assistant roles are supported!') }}"\
         "{% endif %}"\
     "{% endfor %}"
-pass
 
 # Ollama from https://www.ollama.com/library/mistral
-mistral_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """[INST] {{ if .System }}{{ .System }} {{ end }}{{ .Prompt }} [/INST]"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+mistral_ollama = _ollama_template("mistral")
 
 mistral_eos_token = "eos_token"
 CHAT_TEMPLATES["mistral"] = (mistral_template, mistral_eos_token, False, mistral_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["mistral"] = None
 
-# =========================================== Llama-2
 # Adds BOS to every convo! And weird <<SYS>> system messages.
+# =========================================== Llama-2
 llama_template = \
     "{% if messages[0]['role'] == 'system' %}"\
         "{% if messages[1]['role'] == 'user' %}"\
@@ -218,33 +218,23 @@ llama_template = \
             "{{ raise_exception('Only user and assistant roles are supported!') }}"\
         "{% endif %}"\
     "{% endfor %}"
-pass
 
 # Ollama from https://www.ollama.com/library/llama3
-llama_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """[INST] <<SYS>>{{ .System }}<</SYS>>
-
-{{ .Prompt }} [/INST]"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+llama_ollama = _ollama_template("llama")
 
 llama_eos_token = "eos_token"
 CHAT_TEMPLATES["llama"] = (llama_template, llama_eos_token, False, llama_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["llama"] = None
 
-# ===========================================  Vicuna
 # https://github.com/lm-sys/FastChat/blob/main/docs/vicuna_weights_version.md#prompt-template
+# ===========================================  Vicuna
 vicuna_template = \
     "{{ bos_token }}"\
     "{% if messages[0]['role'] == 'system' %}"\
         "{{ messages[0]['content'] + ' ' }}"\
         "{% set loop_messages = messages[1:] %}"\
     "{% else %}"\
-        "{{ 'A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user\\'s questions.' + ' ' }}"\
+        "{{ '{system_message}' + ' ' }}"\
         "{% set loop_messages = messages %}"\
     "{% endif %}"\
     "{% for message in loop_messages %}"\
@@ -259,31 +249,23 @@ vicuna_template = \
     "{% if add_generation_prompt %}"\
         "{{ 'ASSISTANT:' }}"\
     "{% endif %}"
-pass
 
 # Ollama from https://www.ollama.com/library/vicuna
-vicuna_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}{{ .System }} {{ end }}{{ if .Prompt }}USER: {{ .Prompt }} {{ end }}ASSISTANT: {{ .Response }} {__EOS_TOKEN__}"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+vicuna_ollama = _ollama_template("vicuna")
 
 vicuna_eos_token = "eos_token"
 CHAT_TEMPLATES["vicuna"] = (vicuna_template, vicuna_eos_token, False, vicuna_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["vicuna"] = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions."
 
-# =========================================== Vicuna Old
 # https://github.com/lm-sys/FastChat/blob/main/docs/vicuna_weights_version.md#prompt-template
+# =========================================== Vicuna Old
 vicuna_old_template = \
     "{{ bos_token }}"\
     "{% if messages[0]['role'] == 'system' %}"\
         "{{ messages[0]['content'] + '\n' }}"\
         "{% set loop_messages = messages[1:] %}"\
     "{% else %}"\
-        "{{ 'A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human\\'s questions.' + '\n' }}"\
+        "{{ '{system_message}' + '\n' }}"\
         "{% set loop_messages = messages %}"\
     "{% endif %}"\
     "{% for message in loop_messages %}"\
@@ -298,34 +280,25 @@ vicuna_old_template = \
     "{% if add_generation_prompt %}"\
         "{{ '### Assistant:' }}"\
     "{% endif %}"
-pass
 
-vicuna_old_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}{{ .System }}
-{{ end }}{{ if .Prompt }}### Human: {{ .Prompt }}
-{{ end }}### Assistant: {{ .Response }}{__EOS_TOKEN__}
-"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-SYSTEM """A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions."""
-'''
+vicuna_old_ollama = _ollama_template("vicuna_old")
 
 vicuna_old_eos_token = "eos_token"
 CHAT_TEMPLATES["vicuna_old"] = (vicuna_old_template, vicuna_old_eos_token, False, vicuna_old_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["vicuna_old"] = "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions."
 
-# =========================================== Alpaca multi turn
+CHAT_TEMPLATES["vicuna old"] = CHAT_TEMPLATES["vicuna_old"]
+DEFAULT_SYSTEM_MESSAGE["vicuna old"] = DEFAULT_SYSTEM_MESSAGE["vicuna_old"]
+
 # https://github.com/tatsu-lab/stanford_alpaca Changed for multi-turn convos
+# =========================================== Alpaca multi turn
 alpaca_template = \
     "{{ bos_token }}"\
     "{% if messages[0]['role'] == 'system' %}"\
         "{{ messages[0]['content'] + '\n\n' }}"\
         "{% set loop_messages = messages[1:] %}"\
     "{% else %}"\
-        "{{ 'Below are some instructions that describe some tasks. Write responses that appropriately complete each request.\n\n' }}"\
+        "{{ '{system_message}' + '\n\n' }}"\
         "{% set loop_messages = messages %}"\
     "{% endif %}"\
     "{% for message in loop_messages %}"\
@@ -340,39 +313,21 @@ alpaca_template = \
     "{% if add_generation_prompt %}"\
         "{{ '### Response:\n' }}"\
     "{% endif %}"
-pass
 
-alpaca_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}{{ .System }}
-
-{{ end }}{{ if .Prompt }}### Instruction:
-{{ .Prompt }}{{ end }}
-
-### Response:
-{{ .Response }}{__EOS_TOKEN__}
-
-"""
-PARAMETER stop "{__EOS_TOKEN__}"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-SYSTEM """Below are some instructions that describe some tasks. Write responses that appropriately complete each request."""
-'''
+alpaca_ollama = _ollama_template("alpaca")
 
 alpaca_eos_token = "eos_token"
 CHAT_TEMPLATES["alpaca"] = (alpaca_template, alpaca_eos_token, False, alpaca_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["alpaca"] = "Below are some instructions that describe some tasks. Write responses that appropriately complete each request."
 
+# |trim is required for lstrip/rstrip. <start_of_turn> maps to 106 and <end_of_turn> to 107; user
+# and model are normal 1-word tokens.
 # =========================================== Gemma
-# https://huggingface.co/google/gemma-7b-it
-# Notice we must use |trim for lstrip and rstrip. <start_of_turn> maps to 106.
-# <end_of_turn> maps to 107. user and model are normal 1 word tokens.
 gemma_template = \
     "{{ bos_token }}"\
     "{% if messages[0]['role'] == 'system' %}"\
         "{{'<start_of_turn>user\n' + messages[0]['content'] | trim + ' ' + messages[1]['content'] | trim + '<end_of_turn>\n'}}"\
-        "{% set loop_messages = messages[2:] %}"\
+        "{% set messages = messages[2:] %}"\
     "{% endif %}"\
     "{% for message in messages %}"\
         "{% if message['role'] == 'user' %}"\
@@ -386,76 +341,45 @@ gemma_template = \
     "{% if add_generation_prompt %}"\
         "{{ '<start_of_turn>model\n' }}"\
     "{% endif %}"
-pass
 
 # Ollama from https://www.ollama.com/library/gemma
-gemma_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """<start_of_turn>user
-{{ if .System }}{{ .System }} {{ end }}{{ .Prompt }}<end_of_turn>
-<start_of_turn>model
-{{ .Response }}<end_of_turn>
-"""
-PARAMETER repeat_penalty 1
-PARAMETER stop "<start_of_turn>"
-PARAMETER stop "<end_of_turn>"
-PARAMETER penalize_newline false
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+gemma_ollama = _ollama_template("gemma")
 
 gemma_eos_token = "<end_of_turn>"
 CHAT_TEMPLATES["gemma"] = (gemma_template, gemma_eos_token, True, gemma_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["gemma"] = None
 
+# <eos> is still more appropriate here than a ChatML end token.
 # =========================================== Gemma with ChatML instead
-# We find using <eos> is still more appropriate!
 gemma_chatml_template = "{{ bos_token }}" + chatml_template
-pass
 
-gemma_chatml_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}{{ if .Prompt }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-{{ end }}<|im_start|>assistant
-{{ .Response }}<|im_end|>
-"""
-PARAMETER repeat_penalty 1
-PARAMETER stop "<|im_start|>"
-PARAMETER stop "<|im_end|>"
-PARAMETER penalize_newline false
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+gemma_chatml_ollama = _ollama_template("gemma_chatml")
 
 gemma_chatml_eos_token = (
     {"<start_of_turn>" : "<|im_start|>", "<eos>" : "<|im_end|>"},
     "<|im_end|>",
 )
 CHAT_TEMPLATES["gemma_chatml"] = (gemma_chatml_template, gemma_chatml_eos_token, True, gemma_chatml_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["gemma_chatml"] = None
 
-# =========================================== Gemma 2
 # Same as Gemma 1, but with sliding window attention!
 # https://ollama.com/library/gemma2/blobs/6522ca797f47
+# =========================================== Gemma 2
 gemma2_template = gemma_template
-gemma2_ollama = gemma_ollama + "PARAMETER num_ctx 4096\n"
+gemma2_ollama = _ollama_template("gemma2")
 gemma2_eos_token = "<end_of_turn>"
 CHAT_TEMPLATES["gemma2"] = (gemma2_template, gemma2_eos_token, True, gemma2_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma2"] = None
 
 # =========================================== Gemma 2 with ChatML instead
 gemma2_chatml_template = gemma_chatml_template
-gemma2_chatml_ollama = gemma_chatml_ollama + "PARAMETER num_ctx 4096\n"
+gemma2_chatml_ollama = _ollama_template("gemma2_chatml")
 gemma2_chatml_eos_token = gemma_chatml_eos_token
 CHAT_TEMPLATES["gemma2_chatml"] = (gemma2_chatml_template, gemma2_chatml_eos_token, True, gemma2_chatml_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["gemma2_chatml"] = None
 
+# The \n\n really is needed.
 # =========================================== Llama-3
-# Weirdly \n\n is needed?
 llama3_template = \
     "{{ bos_token }}"\
     "{% for message in messages %}"\
@@ -470,33 +394,21 @@ llama3_template = \
     "{% if add_generation_prompt %}"\
         "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"\
     "{% endif %}"
-pass
 
 # Ollama from https://www.ollama.com/library/llama3
-llama3_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}<|start_header_id|>system<|end_header_id|>
-
-{{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>
-
-{{ .Prompt }}<|eot_id|>{{ end }}<|start_header_id|>assistant<|end_header_id|>
-
-{{ .Response }}<|eot_id|>"""
-PARAMETER stop "<|start_header_id|>"
-PARAMETER stop "<|end_header_id|>"
-PARAMETER stop "<|eot_id|>"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+llama3_ollama = _ollama_template("llama-3")
 
 llama3_template_eos_token = "eos_token"
+
 CHAT_TEMPLATES["llama-3"] = (llama3_template, llama3_template_eos_token, False, llama3_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["llama-3"] = None
+
+CHAT_TEMPLATES["llama3"] = (llama3_template, llama3_template_eos_token, False, llama3_ollama,)
+DEFAULT_SYSTEM_MESSAGE["llama3"] = None
 
 
-# =========================================== Phi-3
 # "{{ bos_token }}"\ # Phi-3.5 removes BOS?
+# =========================================== Phi-3
 phi3_template = \
     "{% for message in messages %}"\
         "{% if message['role'] == 'user' %}"\
@@ -510,33 +422,20 @@ phi3_template = \
     "{% if add_generation_prompt %}"\
         "{{ '<|assistant|>\n' }}"\
     "{% endif %}"
-pass
 
 # Ollama from https://www.ollama.com/library/phi3
-phi3_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .System }}<|system|>
-{{ .System }}<|end|>
-{{ end }}{{ if .Prompt }}<|user|>
-{{ .Prompt }}<|end|>
-{{ end }}<|assistant|>
-{{ .Response }}<|end|>
-"""
-PARAMETER stop "<|end|>"
-PARAMETER stop "<|user|>"
-PARAMETER stop "<|assistant|>"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+phi3_ollama = _ollama_template("phi-3")
 
 phi3_template_eos_token = "<|end|>"
 CHAT_TEMPLATES["phi-3"]   = (phi3_template, phi3_template_eos_token, False, phi3_ollama,)
-CHAT_TEMPLATES["phi-35"]  = CHAT_TEMPLATES["phi-3"]
-CHAT_TEMPLATES["phi-3.5"] = CHAT_TEMPLATES["phi-3"]
-pass
+DEFAULT_SYSTEM_MESSAGE["phi-3"] = None
 
-# =========================================== Llama-3.1
+CHAT_TEMPLATES["phi-35"]  = CHAT_TEMPLATES["phi-3"]
+DEFAULT_SYSTEM_MESSAGE["phi-35"] = None
+
+CHAT_TEMPLATES["phi-3.5"] = CHAT_TEMPLATES["phi-3"]
+DEFAULT_SYSTEM_MESSAGE["phi-3.5"] = None
+
 """
 No trimming in Llama 3.1 Instruct!
 Also an extra newline for Cutting Knowledge Date
@@ -573,7 +472,7 @@ llama31_template = \
     {%- set system_message = messages[0]['content'] %}
     {%- set messages = messages[1:] %}
 {%- else %}
-    {%- set system_message = "" %}
+    {%- set system_message = "{system_message}" %}
 {%- endif %}
 
 {#- System message + builtin tools #}
@@ -664,73 +563,20 @@ llama31_template = \
     {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
 {%- endif %}
 """
-pass
 
 # Ollama from https://ollama.com/library/llama3.1 (needs updating!)
-llama31_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{ if .Messages }}
-{{- if or .System .Tools }}<|start_header_id|>system<|end_header_id|>
-{{- if .System }}
-
-{{ .System }}
-{{- end }}
-{{- if .Tools }}
-
-You are a helpful assistant with tool calling capabilities. When you receive a tool call response, use the output to format an answer to the original use question.
-{{- end }}
-{{- end }}<|eot_id|>
-{{- range $i, $_ := .Messages }}
-{{- $last := eq (len (slice $.Messages $i)) 1 }}
-{{- if eq .Role "user" }}<|start_header_id|>user<|end_header_id|>
-{{- if and $.Tools $last }}
-
-Given the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.
-
-Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. Do not use variables.
-
-{{ $.Tools }}
-{{- end }}
-
-{{ .Content }}<|eot_id|>{{ if $last }}<|start_header_id|>assistant<|end_header_id|>
-
-{{ end }}
-{{- else if eq .Role "assistant" }}<|start_header_id|>assistant<|end_header_id|>
-{{- if .ToolCalls }}
-
-{{- range .ToolCalls }}{"name": "{{ .Function.Name }}", "parameters": {{ .Function.Arguments }}}{{ end }}
-{{- else }}
-
-{{ .Content }}{{ if not $last }}<|eot_id|>{{ end }}
-{{- end }}
-{{- else if eq .Role "tool" }}<|start_header_id|>ipython<|end_header_id|>
-
-{{ .Content }}<|eot_id|>{{ if $last }}<|start_header_id|>assistant<|end_header_id|>
-
-{{ end }}
-{{- end }}
-{{- end }}
-{{- else }}
-{{- if .System }}<|start_header_id|>system<|end_header_id|>
-
-{{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>
-
-{{ .Prompt }}<|eot_id|>{{ end }}<|start_header_id|>assistant<|end_header_id|>
-
-{{ end }}{{ .Response }}{{ if .Response }}<|eot_id|>{{ end }}"""
-PARAMETER stop "<|start_header_id|>"
-PARAMETER stop "<|end_header_id|>"
-PARAMETER stop "<|eot_id|>"
-PARAMETER stop "<|eom_id|>"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+llama31_ollama = _ollama_template("llama-3.1")
 
 llama31_template_eos_token = "eos_token"
 CHAT_TEMPLATES["llama-3.1"] = (llama31_template, llama31_template_eos_token, False, llama31_ollama,)
+DEFAULT_SYSTEM_MESSAGE["llama-3.1"] = ""
+
 CHAT_TEMPLATES["llama-31"]  = (llama31_template, llama31_template_eos_token, False, llama31_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["llama-31"] = ""
+
+for version in ("llama-3.2", "llama-3.3", "llama-32", "llama-33"):
+    CHAT_TEMPLATES[version] = CHAT_TEMPLATES["llama-3.1"]
+    DEFAULT_SYSTEM_MESSAGE[version] = ""
 
 
 # =========================================== Qwen 2.5
@@ -751,7 +597,7 @@ qwen25_template = \
     {%- if messages[0][\'role\'] == \'system\' %}
         {{- \'<|im_start|>system\\n\' + messages[0][\'content\'] + \'<|im_end|>\\n\' }}
     {%- else %}
-        {{- \'<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n\' }}
+        {{- \'<|im_start|>system\\n{system_message}<|im_end|>\\n\' }}
     {%- endif %}\n{%- endif %}\n{%- for message in messages %}
     {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}
         {{- \'<|im_start|>\' + message.role + \'\\n\' + message.content + \'<|im_end|>\' + \'\\n\' }}
@@ -787,71 +633,1826 @@ qwen25_template = \
 
 
 # Ollama from https://ollama.com/library/qwen2.5/blobs/eb4402837c78
-qwen25_ollama = \
-'''
-FROM {__FILE_LOCATION__}
-TEMPLATE """{{- if .Messages }}
-{{- if or .System .Tools }}<|im_start|>system
-{{- if .System }}
-{{ .System }}
-{{- end }}
-{{- if .Tools }}
-
-# Tools
-
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{{- range .Tools }}
-{"type": "function", "function": {{ .Function }}}
-{{- end }}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>
-{{- end }}<|im_end|>
-{{ end }}
-{{- range $i, $_ := .Messages }}
-{{- $last := eq (len (slice $.Messages $i)) 1 -}}
-{{- if eq .Role "user" }}<|im_start|>user
-{{ .Content }}<|im_end|>
-{{ else if eq .Role "assistant" }}<|im_start|>assistant
-{{ if .Content }}{{ .Content }}
-{{- else if .ToolCalls }}<tool_call>
-{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
-{{ end }}</tool_call>
-{{- end }}{{ if not $last }}<|im_end|>
-{{ end }}
-{{- else if eq .Role "tool" }}<|im_start|>user
-<tool_response>
-{{ .Content }}
-</tool_response><|im_end|>
-{{ end }}
-{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
-{{ end }}
-{{- end }}
-{{- else }}
-{{- if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}{{ if .Prompt }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-{{ end }}<|im_start|>assistant
-{{ end }}{{ .Response }}{{ if .Response }}<|im_end|>{{ end }}"""
-PARAMETER stop "<|im_end|>"
-PARAMETER stop "<|endoftext|>"
-PARAMETER temperature 1.5
-PARAMETER min_p 0.1
-'''
+qwen25_ollama = _ollama_template("qwen-2.5")
 
 qwen25_template_eos_token = "eos_token"
+qwen25_default_system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 CHAT_TEMPLATES["qwen-2.5"] = (qwen25_template, qwen25_template_eos_token, False, qwen25_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen-2.5"] = qwen25_default_system_message
+
 CHAT_TEMPLATES["qwen-25"]  = (qwen25_template, qwen25_template_eos_token, False, qwen25_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen-25"] = qwen25_default_system_message
+
 CHAT_TEMPLATES["qwen25"]   = (qwen25_template, qwen25_template_eos_token, False, qwen25_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen25"] = qwen25_default_system_message
+
 CHAT_TEMPLATES["qwen2.5"]  = (qwen25_template, qwen25_template_eos_token, False, qwen25_ollama,)
-pass
+DEFAULT_SYSTEM_MESSAGE["qwen2.5"] = qwen25_default_system_message
+
+qwen25_coder_ollama = _ollama_template("qwen-25-coder")
+CHAT_TEMPLATES["qwen-2.5-coder"] = (qwen25_template, qwen25_template_eos_token, False, qwen25_coder_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen-2.5-coder"] = qwen25_default_system_message
+
+CHAT_TEMPLATES["qwen-25-coder"] = (qwen25_template, qwen25_template_eos_token, False, qwen25_coder_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen-25-coder"] = qwen25_default_system_message
+
+CHAT_TEMPLATES["qwen2.5-coder"] = (qwen25_template, qwen25_template_eos_token, False, qwen25_coder_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen2.5-coder"] = qwen25_default_system_message
+
+CHAT_TEMPLATES["qwen25-coder"] = (qwen25_template, qwen25_template_eos_token, False, qwen25_coder_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen25-coder"] = qwen25_default_system_message
+
+# "{{ bos_token }}"\ # Phi-4 removes BOS?
+# =========================================== Phi-4
+phi4_template = \
+    "{% for message in messages %}"\
+        "{% if (message['role'] == 'system') %}"\
+            "{{'<|im_start|>system<|im_sep|>' + message['content'] + '<|im_end|>'}}"\
+        "{% elif (message['role'] == 'user') %}"\
+            "{{'<|im_start|>user<|im_sep|>' + message['content'] + '<|im_end|>'}}"\
+        "{% elif (message['role'] == 'assistant') %}"\
+            "{{'<|im_start|>assistant<|im_sep|>' + message['content'] + '<|im_end|>'}}"\
+        "{% endif %}"\
+    "{% endfor %}"\
+    "{% if add_generation_prompt %}"\
+        "{{ '<|im_start|>assistant<|im_sep|>' }}"\
+    "{% endif %}"
+
+_phi4_ollama_template = \
+    "{{ if .System }}<|im_start|><|system|><|im_sep|>{{ .System }}<|im_end|>{{ end }}"\
+    "{{ if .Prompt }}<|im_start|><|user|><|im_sep|>{{ .Prompt }}<|im_end|>{{ end }}"\
+    "<|im_start|><|assistant|><|im_sep|>{{ .Response }}<|im_end|>"
+
+# Ollama from https://www.ollama.com/library/phi4 is different
+phi4_ollama = _ollama_template("phi-4")
+
+phi4_template_eos_token = "<|im_end|>"
+CHAT_TEMPLATES["phi-4"] = (phi4_template, phi4_template_eos_token, False, phi4_ollama,)
+DEFAULT_SYSTEM_MESSAGE["phi-4"] = None
+
+
+# Obtained via print(tokenizer.chat_template.replace("}\n", "####").replace("\n", "\\n").replace("####", "}\n"))
+# =========================================== Gemma-3
+gemma3_template = \
+"""{{ bos_token }}
+{%- if messages[0]['role'] == 'system' -%}
+    {%- if messages[0]['content'] is string -%}
+        {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}
+    {%- else -%}
+        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}
+    {%- endif -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set first_user_prefix = "" -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}
+        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
+    {%- endif -%}
+    {%- if (message['role'] == 'assistant') -%}
+        {%- set role = "model" -%}
+    {%- else -%}
+        {%- set role = message['role'] -%}
+    {%- endif -%}
+    {{ '<start_of_turn>' + role + '\n' + (first_user_prefix if loop.first else "") }}
+    {%- if message['content'] is string -%}
+        {{ message['content'] | trim }}
+    {%- elif message['content'] is iterable -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'image' -%}
+                {{ '<start_of_image>' }}
+            {%- elif item['type'] == 'text' -%}
+                {{ item['text'] | trim }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{ raise_exception("Invalid content type") }}
+    {%- endif -%}
+    {{ '<end_of_turn>\n' }}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{ '<start_of_turn>model\n' }}
+{%- endif -%}
+"""
+
+# Ollama from https://ollama.com/library/gemma3/blobs/e0a42594d802
+gemma3_ollama = _ollama_template("gemma-3")
+
+gemma3_template_eos_token = "<end_of_turn>"
+CHAT_TEMPLATES["gemma-3"] = (gemma3_template, gemma3_template_eos_token, False, gemma3_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma-3"] = None
+
+CHAT_TEMPLATES["gemma3"] = (gemma3_template, gemma3_template_eos_token, False, gemma3_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma3"] = None
+
+# Official Qwen-3 chat template (see https://ollama.com/library/qwen3/blobs/eb4402837c78)
+# =========================================== Qwen-3
+qwen3_template = \
+"""
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\\"name\\": <function-name>, \\"arguments\\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for forward_message in messages %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- set message = messages[index] %}
+    {%- set current_content = message.content if message.content is not none else '' %}
+    {%- set tool_start = '<tool_response>' %}
+    {%- set tool_start_length = tool_start|length %}
+    {%- set start_of_message = current_content[:tool_start_length] %}
+    {%- set tool_end = '</tool_response>' %}
+    {%- set tool_end_length = tool_end|length %}
+    {%- set start_pos = (current_content|length) - tool_end_length %}
+    {%- if start_pos < 0 %}
+        {%- set start_pos = 0 %}
+    {%- endif %}
+    {%- set end_of_message = current_content[start_pos:] %}
+    {%- if ns.multi_step_tool and message.role == "user" and not(start_of_message == tool_start and end_of_message == tool_end) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set content = message.content %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in message.content %}
+                {%- set content = (message.content.split('</think>')|last).lstrip('\n') %}
+                {%- set reasoning_content = (message.content.split('</think>')|first).rstrip('\n') %}
+                {%- set reasoning_content = (reasoning_content.split('<think>')|last).lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}
+"""
+
+qwen3_ollama = _ollama_template("qwen-3")
+qwen3_template_eos_token = "<|im_end|>"
+CHAT_TEMPLATES["qwen-3"] = (qwen3_template, qwen3_template_eos_token, False, qwen3_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen-3"] = None
+
+CHAT_TEMPLATES["qwen3"] = (qwen3_template, qwen3_template_eos_token, False, qwen3_ollama,)
+DEFAULT_SYSTEM_MESSAGE["qwen3"] = None
+
+# Obtained via print(tokenizer.chat_template.replace("}\n", "####").replace("\n", "\\n").replace("####", "}\n"))
+# =========================================== Gemma-3n
+gemma3n_template = \
+"""{{ bos_token }}
+{%- if messages[0]['role'] == 'system' -%}
+    {%- if messages[0]['content'] is string -%}
+        {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}
+    {%- else -%}
+        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}
+    {%- endif -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set first_user_prefix = "" -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}
+        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
+    {%- endif -%}
+    {%- if (message['role'] == 'assistant') -%}
+        {%- set role = "model" -%}
+    {%- else -%}
+        {%- set role = message['role'] -%}
+    {%- endif -%}
+    {{ '<start_of_turn>' + role + '\n' + (first_user_prefix if loop.first else "") }}
+    {%- if message['content'] is string -%}
+        {{ message['content'] | trim }}
+    {%- elif message['content'] is iterable -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'audio' -%}
+                {{ '<audio_soft_token>' }}
+            {%- elif item['type'] == 'image' -%}
+                {{ '<image_soft_token>' }}
+            {%- elif item['type'] == 'text' -%}
+                {{ item['text'] | trim }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{ raise_exception("Invalid content type") }}
+    {%- endif -%}
+    {{ '<end_of_turn>\n' }}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{'<start_of_turn>model\n'}}
+{%- endif -%}
+"""
+
+# Ollama from https://ollama.com/library/gemma3n/blobs/e0a42594d802
+gemma3n_ollama = _ollama_template("gemma-3n")
+gemma3n_template_eos_token = "<end_of_turn>"
+CHAT_TEMPLATES["gemma-3n"] = (gemma3n_template, gemma3n_template_eos_token, False, gemma3n_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma-3n"] = None
+
+CHAT_TEMPLATES["gemma3n"] = (gemma3n_template, gemma3n_template_eos_token, False, gemma3n_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma3n"] = None
+
+# Gemma-4 uses <|turn>role\n...<turn|>\n format
+# =========================================== Gemma-4
+gemma4_template = \
+"""{%- macro format_parameters(properties, required, filter_keys=false) -%}
+    {%- set standard_keys = ['description', 'type', 'properties', 'required', 'nullable'] -%}
+    {%- set ns = namespace(found_first=false) -%}
+    {%- for key, value in properties | dictsort -%}
+        {%- set add_comma = false -%}
+        {%- if not filter_keys or key not in standard_keys -%}
+            {%- if ns.found_first %},{% endif -%}
+            {%- set ns.found_first = true -%}
+            {{ key }}:{
+            {%- if value['description'] -%}
+                description:<|"|>{{ value['description'] }}<|"|>
+                {%- set add_comma = true -%}
+            {%- endif -%}
+            {%- if value['type'] | upper == 'STRING' -%}
+                {%- if value['enum'] -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    enum:{{ format_argument(value['enum']) }}
+                {%- endif -%}
+            {%- elif value['type'] | upper == 'ARRAY' -%}
+                {%- if value['items'] is mapping and value['items'] -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    items:{
+                    {%- set ns_items = namespace(found_first=false) -%}
+                    {%- for item_key, item_value in value['items'] | dictsort -%}
+                        {%- if item_value is not none -%}
+                            {%- if ns_items.found_first %},{% endif -%}
+                            {%- set ns_items.found_first = true -%}
+                            {%- if item_key == 'properties' -%}
+                                properties:{
+                                {%- if item_value is mapping -%}
+                                    {{- format_parameters(item_value, value['items']['required'] | default([])) -}}
+                                {%- endif -%}
+                                }
+                            {%- elif item_key == 'required' -%}
+                                required:[
+                                {%- for req_item in item_value -%}
+                                    <|"|>{{- req_item -}}<|"|>
+                                    {%- if not loop.last %},{% endif -%}
+                                {%- endfor -%}
+                                ]
+                            {%- elif item_key == 'type' -%}
+                                {%- if item_value is string -%}
+                                    type:{{ format_argument(item_value | upper) }}
+                                {%- else -%}
+                                    type:{{ format_argument(item_value | map('upper') | list) }}
+                                {%- endif -%}
+                            {%- else -%}
+                                {{ item_key }}:{{ format_argument(item_value) }}
+                            {%- endif -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                    }
+                {%- endif -%}
+            {%- endif -%}
+            {%- if value['nullable'] %}
+                {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                nullable:true
+            {%- endif -%}
+            {%- if value['type'] | upper == 'OBJECT' -%}
+                {%- if value['properties'] is defined and value['properties'] is mapping -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    properties:{
+                    {{- format_parameters(value['properties'], value['required'] | default([])) -}}
+                    }
+                {%- elif value is mapping -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    properties:{
+                    {{- format_parameters(value, value['required'] | default([]), filter_keys=true) -}}
+                    }
+                {%- endif -%}
+                {%- if value['required'] -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    required:[
+                    {%- for item in value['required'] | default([]) -%}
+                        <|"|>{{- item -}}<|"|>
+                        {%- if not loop.last %},{% endif -%}
+                    {%- endfor -%}
+                    ]
+                {%- endif -%}
+            {%- endif -%}
+            {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+            type:<|"|>{{ value['type'] | upper }}<|"|>}
+        {%- endif -%}
+    {%- endfor -%}
+{%- endmacro -%}
+{%- macro format_function_declaration(tool_data) -%}
+    declaration:{{- tool_data['function']['name'] -}}{description:<|"|>{{- tool_data['function']['description'] -}}<|"|>
+    {%- set params = tool_data['function']['parameters'] -%}
+    {%- if params -%}
+        ,parameters:{
+        {%- if params['properties'] -%}
+            properties:{ {{- format_parameters(params['properties'], params['required']) -}} },
+        {%- endif -%}
+        {%- if params['required'] -%}
+            required:[
+            {%- for item in params['required'] -%}
+                <|"|>{{- item -}}<|"|>
+                {{- ',' if not loop.last -}}
+            {%- endfor -%}
+            ],
+        {%- endif -%}
+        {%- if params['type'] -%}
+            type:<|"|>{{- params['type'] | upper -}}<|"|>}
+        {%- endif -%}
+    {%- endif -%}
+    {%- if 'response' in tool_data['function'] -%}
+        {%- set response_declaration = tool_data['function']['response'] -%}
+        ,response:{
+        {%- if response_declaration['description'] -%}
+            description:<|"|>{{- response_declaration['description'] -}}<|"|>,
+        {%- endif -%}
+        {%- if response_declaration['type'] | upper == 'OBJECT' -%}
+            type:<|"|>{{- response_declaration['type'] | upper -}}<|"|>}
+        {%- endif -%}
+    {%- endif -%}
+    }
+{%- endmacro -%}
+{%- macro format_argument(argument, escape_keys=True) -%}
+    {%- if argument is none -%}
+        {{- 'null' -}}
+    {%- elif argument is string -%}
+        {{- '<|"|>' + argument + '<|"|>' -}}
+    {%- elif argument is boolean -%}
+        {{- 'true' if argument else 'false' -}}
+    {%- elif argument is mapping -%}
+        {{- '{' -}}
+        {%- set ns = namespace(found_first=false) -%}
+        {%- for key, value in argument | dictsort -%}
+            {%- if ns.found_first %},{% endif -%}
+            {%- set ns.found_first = true -%}
+            {%- if escape_keys -%}
+                {{- '<|"|>' + key + '<|"|>' -}}
+            {%- else -%}
+                {{- key -}}
+            {%- endif -%}
+            :{{- format_argument(value, escape_keys=escape_keys) -}}
+        {%- endfor -%}
+        {{- '}' -}}
+    {%- elif argument is sequence -%}
+        {{- '[' -}}
+        {%- for item in argument -%}
+            {{- format_argument(item, escape_keys=escape_keys) -}}
+            {%- if not loop.last %},{% endif -%}
+        {%- endfor -%}
+        {{- ']' -}}
+    {%- else -%}
+        {{- argument -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro strip_thinking(text) -%}
+    {%- set ns = namespace(result='') -%}
+    {%- for part in text.split('<channel|>') -%}
+        {%- if '<|channel>' in part -%}
+            {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
+        {%- else -%}
+            {%- set ns.result = ns.result + part -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- ns.result | trim -}}
+{%- endmacro -%}
+{%- macro format_tool_response_block(tool_name, response) -%}
+    {{- '<|tool_response>' -}}
+    {%- if response is mapping -%}
+        {{- 'response:' + tool_name + '{' -}}
+        {%- for key, value in response | dictsort -%}
+            {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+            {%- if not loop.last %},{% endif -%}
+        {%- endfor -%}
+        {{- '}' -}}
+    {%- else -%}
+        {{- 'response:' + tool_name + '{value:' + format_argument(response, escape_keys=False) + '}' -}}
+    {%- endif -%}
+    {{- '<tool_response|>' -}}
+{%- endmacro -%}
+{%- set thinking = enable_thinking is defined and enable_thinking -%}
+{%- set loop_messages = messages -%}
+{%- if messages[0]['role'] in ['system', 'developer'] or thinking or (tools is defined and tools) -%}
+    {{ '<|turn>system\n' }}
+    {%- if thinking -%}
+        {{ '<|think|>\n' }}
+    {%- endif -%}
+    {%- if messages[0]['role'] in ['system', 'developer'] -%}
+        {{ messages[0]['content'] | trim }}
+        {%- set loop_messages = messages[1:] -%}
+    {%- endif -%}
+    {%- if tools is defined and tools -%}
+        {%- for tool in tools -%}
+            {{- '<|tool>' + format_function_declaration(tool) | trim + '<tool|>' -}}
+        {%- endfor -%}
+    {%- endif -%}
+    {{ '<turn|>\n' }}
+{%- endif -%}
+{%- set ns_tool = namespace(turns=0, tool_calls=false, tool_response=false) -%}
+{%- for message in loop_messages -%}
+    {%- if message['role'] != 'tool' -%}
+    {%- set continues = message['role'] == 'assistant' and ns_tool.tool_calls -%}
+    {%- if not continues and (message['role'] == 'user') != (ns_tool.turns % 2 == 0) -%}
+        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
+    {%- endif -%}
+    {%- if (message['role'] == 'assistant') -%}
+        {%- set role = "model" -%}
+    {%- else -%}
+        {%- set role = message['role'] -%}
+    {%- endif -%}
+    {%- if not continues -%}
+        {%- set ns_tool.turns = ns_tool.turns + 1 -%}
+        {{ '<|turn>' + role + '\n' }}
+    {%- endif -%}
+    {%- set ns_tool.tool_calls = message.get('tool_calls') -%}
+    {%- if ns_tool.tool_calls -%}
+        {%- for tool_call in ns_tool.tool_calls -%}
+            {%- set function = tool_call['function'] -%}
+            {{- '<|tool_call>call:' + function['name'] + '{' -}}
+            {%- if function['arguments'] is mapping -%}
+                {%- set ns_args = namespace(found_first=false) -%}
+                {%- for key, value in function['arguments'] | dictsort -%}
+                    {%- if ns_args.found_first %},{% endif -%}
+                    {%- set ns_args.found_first = true -%}
+                    {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+                {%- endfor -%}
+            {%- elif function['arguments'] is string -%}
+                {%- set argstr = function['arguments'] | trim -%}
+                {%- if argstr[:1] == '{' and argstr[-1:] == '}' -%}
+                    {{- argstr[1:-1] -}}
+                {%- else -%}
+                    {{- function['arguments'] -}}
+                {%- endif -%}
+            {%- endif -%}
+            {{- '}<tool_call|>' -}}
+        {%- endfor -%}
+        {%- set ns_tool.tool_response = false -%}
+        {%- for tool_response in message.get('tool_responses') or [] -%}
+            {{- format_tool_response_block(tool_response['name'] | default('unknown', true), tool_response['response']) -}}
+            {%- set ns_tool.tool_response = true -%}
+        {%- endfor -%}
+        {%- set ns_scan = namespace(stopped=false, next_role=none) -%}
+        {%- for k in range(loop.index0 + 1, loop_messages | length) -%}
+            {%- if ns_scan.stopped -%}
+            {%- elif loop_messages[k]['role'] != 'tool' -%}
+                {%- set ns_scan.stopped = true -%}
+                {%- set ns_scan.next_role = loop_messages[k]['role'] -%}
+            {%- elif not message.get('tool_responses') -%}
+                {%- set follow = loop_messages[k] -%}
+                {%- set ns_tname = namespace(name=follow.get('name') or 'unknown') -%}
+                {%- for tc in ns_tool.tool_calls -%}
+                    {%- if tc.get('id') == follow.get('tool_call_id') -%}
+                        {%- set ns_tname.name = tc['function']['name'] -%}
+                    {%- endif -%}
+                {%- endfor -%}
+                {%- set tool_body = follow.get('content') -%}
+                {%- if tool_body is sequence and tool_body is not string and tool_body is not mapping -%}
+                    {%- set ns_txt = namespace(s='') -%}
+                    {%- for part in tool_body -%}
+                        {%- if part.get('type') == 'text' -%}
+                            {%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                    {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
+                    {%- for part in tool_body -%}
+                        {%- if part.get('type') in ['image', 'image_url'] -%}
+                            {{- '<|image|>' -}}
+                        {%- elif part.get('type') in ['audio', 'input_audio'] -%}
+                            {{- '<|audio|>' -}}
+                        {%- elif part.get('type') == 'video' -%}
+                            {{- '<|video|>' -}}
+                        {%- endif -%}
+                    {%- endfor -%}
+                {%- else -%}
+                    {{- format_tool_response_block(ns_tname.name, tool_body) -}}
+                {%- endif -%}
+                {%- set ns_tool.tool_response = true -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- set captured_content -%}
+    {%- if message['content'] is string -%}
+        {%- if role == "model" -%}
+            {{ strip_thinking(message['content']) }}
+        {%- else -%}
+            {{ message['content'] | trim }}
+        {%- endif -%}
+    {%- elif message['content'] is iterable -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'audio' -%}
+                {{ '<|audio|>' }}
+            {%- elif item['type'] == 'image' -%}
+                {{ '<|image|>' }}
+            {%- elif item['type'] == 'video' -%}
+                {{ '<|video|>' }}
+            {%- elif item['type'] == 'text' -%}
+                {%- if role == "model" -%}
+                    {{ strip_thinking(item['text']) }}
+                {%- else -%}
+                    {{ item['text'] | trim }}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif not ns_tool.tool_calls -%}
+        {{ raise_exception("Invalid content type") }}
+    {%- endif -%}
+    {%- endset -%}
+    {{- captured_content -}}
+    {%- if not ns_tool.tool_calls -%}
+        {{ '<turn|>\n' }}
+    {%- elif not ns_tool.tool_response -%}
+        {{- '<|tool_response>' -}}
+    {%- elif ns_scan.next_role != 'assistant' and (captured_content | trim | length > 0 or ns_scan.next_role) -%}
+        {{- '<turn|>\n' -}}
+        {%- set ns_tool.tool_calls = false -%}
+    {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {%- if not ns_tool.tool_calls -%}
+    {{'<|turn>model\n'}}
+    {%- elif ns_tool.tool_response and thinking -%}
+        {{- '<|channel>thought\n' -}}
+    {%- endif -%}
+{%- endif -%}
+"""
+
+try:
+    gemma4_ollama = _ollama_template("gemma-4")
+except KeyError:
+    gemma4_ollama = ""
+gemma4_template_eos_token = "<turn|>"
+CHAT_TEMPLATES["gemma-4"] = (gemma4_template, gemma4_template_eos_token, False, gemma4_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma-4"] = None
+
+CHAT_TEMPLATES["gemma4"] = (gemma4_template, gemma4_template_eos_token, False, gemma4_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma4"] = None
+
+# Gemma-4 thinking template
+gemma4_thinking_template = \
+"""{%- macro format_parameters(properties, required, filter_keys=false) -%}
+    {%- set standard_keys = ['description', 'type', 'properties', 'required', 'nullable'] -%}
+    {%- set ns = namespace(found_first=false) -%}
+    {%- for key, value in properties | dictsort -%}
+        {%- set add_comma = false -%}
+        {%- if not filter_keys or key not in standard_keys -%}
+            {%- if ns.found_first %},{% endif -%}
+            {%- set ns.found_first = true -%}
+            {{ key }}:{
+            {%- if value['description'] -%}
+                description:<|"|>{{ value['description'] }}<|"|>
+                {%- set add_comma = true -%}
+            {%- endif -%}
+            {%- if value['type'] | upper == 'STRING' -%}
+                {%- if value['enum'] -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    enum:{{ format_argument(value['enum']) }}
+                {%- endif -%}
+            {%- elif value['type'] | upper == 'ARRAY' -%}
+                {%- if value['items'] is mapping and value['items'] -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    items:{
+                    {%- set ns_items = namespace(found_first=false) -%}
+                    {%- for item_key, item_value in value['items'] | dictsort -%}
+                        {%- if item_value is not none -%}
+                            {%- if ns_items.found_first %},{% endif -%}
+                            {%- set ns_items.found_first = true -%}
+                            {%- if item_key == 'properties' -%}
+                                properties:{
+                                {%- if item_value is mapping -%}
+                                    {{- format_parameters(item_value, value['items']['required'] | default([])) -}}
+                                {%- endif -%}
+                                }
+                            {%- elif item_key == 'required' -%}
+                                required:[
+                                {%- for req_item in item_value -%}
+                                    <|"|>{{- req_item -}}<|"|>
+                                    {%- if not loop.last %},{% endif -%}
+                                {%- endfor -%}
+                                ]
+                            {%- elif item_key == 'type' -%}
+                                {%- if item_value is string -%}
+                                    type:{{ format_argument(item_value | upper) }}
+                                {%- else -%}
+                                    type:{{ format_argument(item_value | map('upper') | list) }}
+                                {%- endif -%}
+                            {%- else -%}
+                                {{ item_key }}:{{ format_argument(item_value) }}
+                            {%- endif -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                    }
+                {%- endif -%}
+            {%- endif -%}
+            {%- if value['nullable'] %}
+                {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                nullable:true
+            {%- endif -%}
+            {%- if value['type'] | upper == 'OBJECT' -%}
+                {%- if value['properties'] is defined and value['properties'] is mapping -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    properties:{
+                    {{- format_parameters(value['properties'], value['required'] | default([])) -}}
+                    }
+                {%- elif value is mapping -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    properties:{
+                    {{- format_parameters(value, value['required'] | default([]), filter_keys=true) -}}
+                    }
+                {%- endif -%}
+                {%- if value['required'] -%}
+                    {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+                    required:[
+                    {%- for item in value['required'] | default([]) -%}
+                        <|"|>{{- item -}}<|"|>
+                        {%- if not loop.last %},{% endif -%}
+                    {%- endfor -%}
+                    ]
+                {%- endif -%}
+            {%- endif -%}
+            {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
+            type:<|"|>{{ value['type'] | upper }}<|"|>}
+        {%- endif -%}
+    {%- endfor -%}
+{%- endmacro -%}
+{%- macro format_function_declaration(tool_data) -%}
+    declaration:{{- tool_data['function']['name'] -}}{description:<|"|>{{- tool_data['function']['description'] -}}<|"|>
+    {%- set params = tool_data['function']['parameters'] -%}
+    {%- if params -%}
+        ,parameters:{
+        {%- if params['properties'] -%}
+            properties:{ {{- format_parameters(params['properties'], params['required']) -}} },
+        {%- endif -%}
+        {%- if params['required'] -%}
+            required:[
+            {%- for item in params['required'] -%}
+                <|"|>{{- item -}}<|"|>
+                {{- ',' if not loop.last -}}
+            {%- endfor -%}
+            ],
+        {%- endif -%}
+        {%- if params['type'] -%}
+            type:<|"|>{{- params['type'] | upper -}}<|"|>}
+        {%- endif -%}
+    {%- endif -%}
+    {%- if 'response' in tool_data['function'] -%}
+        {%- set response_declaration = tool_data['function']['response'] -%}
+        ,response:{
+        {%- if response_declaration['description'] -%}
+            description:<|"|>{{- response_declaration['description'] -}}<|"|>,
+        {%- endif -%}
+        {%- if response_declaration['type'] | upper == 'OBJECT' -%}
+            type:<|"|>{{- response_declaration['type'] | upper -}}<|"|>}
+        {%- endif -%}
+    {%- endif -%}
+    }
+{%- endmacro -%}
+{%- macro format_argument(argument, escape_keys=True) -%}
+    {%- if argument is none -%}
+        {{- 'null' -}}
+    {%- elif argument is string -%}
+        {{- '<|"|>' + argument + '<|"|>' -}}
+    {%- elif argument is boolean -%}
+        {{- 'true' if argument else 'false' -}}
+    {%- elif argument is mapping -%}
+        {{- '{' -}}
+        {%- set ns = namespace(found_first=false) -%}
+        {%- for key, value in argument | dictsort -%}
+            {%- if ns.found_first %},{% endif -%}
+            {%- set ns.found_first = true -%}
+            {%- if escape_keys -%}
+                {{- '<|"|>' + key + '<|"|>' -}}
+            {%- else -%}
+                {{- key -}}
+            {%- endif -%}
+            :{{- format_argument(value, escape_keys=escape_keys) -}}
+        {%- endfor -%}
+        {{- '}' -}}
+    {%- elif argument is sequence -%}
+        {{- '[' -}}
+        {%- for item in argument -%}
+            {{- format_argument(item, escape_keys=escape_keys) -}}
+            {%- if not loop.last %},{% endif -%}
+        {%- endfor -%}
+        {{- ']' -}}
+    {%- else -%}
+        {{- argument -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro strip_thinking(text) -%}
+    {%- set ns = namespace(result='') -%}
+    {%- for part in text.split('<channel|>') -%}
+        {%- if '<|channel>' in part -%}
+            {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
+        {%- else -%}
+            {%- set ns.result = ns.result + part -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- ns.result | trim -}}
+{%- endmacro -%}
+{%- macro format_tool_response_block(tool_name, response) -%}
+    {{- '<|tool_response>' -}}
+    {%- if response is mapping -%}
+        {{- 'response:' + tool_name + '{' -}}
+        {%- for key, value in response | dictsort -%}
+            {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+            {%- if not loop.last %},{% endif -%}
+        {%- endfor -%}
+        {{- '}' -}}
+    {%- else -%}
+        {{- 'response:' + tool_name + '{value:' + format_argument(response, escape_keys=False) + '}' -}}
+    {%- endif -%}
+    {{- '<tool_response|>' -}}
+{%- endmacro -%}
+{%- set thinking = enable_thinking is defined and enable_thinking -%}
+{%- set loop_messages = messages -%}
+{%- if messages[0]['role'] in ['system', 'developer'] or thinking or (tools is defined and tools) -%}
+    {{ '<|turn>system\n' }}
+    {%- if thinking -%}
+        {{ '<|think|>\n' }}
+    {%- endif -%}
+    {%- if messages[0]['role'] in ['system', 'developer'] -%}
+        {{ messages[0]['content'] | trim }}
+        {%- set loop_messages = messages[1:] -%}
+    {%- endif -%}
+    {%- if tools is defined and tools -%}
+        {%- for tool in tools -%}
+            {{- '<|tool>' + format_function_declaration(tool) | trim + '<tool|>' -}}
+        {%- endfor -%}
+    {%- endif -%}
+    {{ '<turn|>\n' }}
+{%- endif -%}
+{%- set ns_tool = namespace(turns=0, tool_calls=false, tool_response=false) -%}
+{%- for message in loop_messages -%}
+    {%- if message['role'] != 'tool' -%}
+    {%- set continues = message['role'] == 'assistant' and ns_tool.tool_calls -%}
+    {%- if not continues and (message['role'] == 'user') != (ns_tool.turns % 2 == 0) -%}
+        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
+    {%- endif -%}
+    {%- if (message['role'] == 'assistant') -%}
+        {%- set role = "model" -%}
+    {%- else -%}
+        {%- set role = message['role'] -%}
+    {%- endif -%}
+    {%- if not continues -%}
+        {%- set ns_tool.turns = ns_tool.turns + 1 -%}
+        {{ '<|turn>' + role + '\n' }}
+    {%- endif -%}
+    {%- set ns_tool.tool_calls = message.get('tool_calls') -%}
+    {%- if ns_tool.tool_calls -%}
+        {%- for tool_call in ns_tool.tool_calls -%}
+            {%- set function = tool_call['function'] -%}
+            {{- '<|tool_call>call:' + function['name'] + '{' -}}
+            {%- if function['arguments'] is mapping -%}
+                {%- set ns_args = namespace(found_first=false) -%}
+                {%- for key, value in function['arguments'] | dictsort -%}
+                    {%- if ns_args.found_first %},{% endif -%}
+                    {%- set ns_args.found_first = true -%}
+                    {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+                {%- endfor -%}
+            {%- elif function['arguments'] is string -%}
+                {%- set argstr = function['arguments'] | trim -%}
+                {%- if argstr[:1] == '{' and argstr[-1:] == '}' -%}
+                    {{- argstr[1:-1] -}}
+                {%- else -%}
+                    {{- function['arguments'] -}}
+                {%- endif -%}
+            {%- endif -%}
+            {{- '}<tool_call|>' -}}
+        {%- endfor -%}
+        {%- set ns_tool.tool_response = false -%}
+        {%- for tool_response in message.get('tool_responses') or [] -%}
+            {{- format_tool_response_block(tool_response['name'] | default('unknown', true), tool_response['response']) -}}
+            {%- set ns_tool.tool_response = true -%}
+        {%- endfor -%}
+        {%- set ns_scan = namespace(stopped=false, next_role=none) -%}
+        {%- for k in range(loop.index0 + 1, loop_messages | length) -%}
+            {%- if ns_scan.stopped -%}
+            {%- elif loop_messages[k]['role'] != 'tool' -%}
+                {%- set ns_scan.stopped = true -%}
+                {%- set ns_scan.next_role = loop_messages[k]['role'] -%}
+            {%- elif not message.get('tool_responses') -%}
+                {%- set follow = loop_messages[k] -%}
+                {%- set ns_tname = namespace(name=follow.get('name') or 'unknown') -%}
+                {%- for tc in ns_tool.tool_calls -%}
+                    {%- if tc.get('id') == follow.get('tool_call_id') -%}
+                        {%- set ns_tname.name = tc['function']['name'] -%}
+                    {%- endif -%}
+                {%- endfor -%}
+                {%- set tool_body = follow.get('content') -%}
+                {%- if tool_body is sequence and tool_body is not string and tool_body is not mapping -%}
+                    {%- set ns_txt = namespace(s='') -%}
+                    {%- for part in tool_body -%}
+                        {%- if part.get('type') == 'text' -%}
+                            {%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                    {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
+                    {%- for part in tool_body -%}
+                        {%- if part.get('type') in ['image', 'image_url'] -%}
+                            {{- '<|image|>' -}}
+                        {%- elif part.get('type') in ['audio', 'input_audio'] -%}
+                            {{- '<|audio|>' -}}
+                        {%- elif part.get('type') == 'video' -%}
+                            {{- '<|video|>' -}}
+                        {%- endif -%}
+                    {%- endfor -%}
+                {%- else -%}
+                    {{- format_tool_response_block(ns_tname.name, tool_body) -}}
+                {%- endif -%}
+                {%- set ns_tool.tool_response = true -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- set captured_content -%}
+    {%- if message['content'] is string -%}
+        {%- if role == "model" -%}
+            {{ strip_thinking(message['content']) }}
+        {%- else -%}
+            {{ message['content'] | trim }}
+        {%- endif -%}
+    {%- elif message['content'] is iterable -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'audio' -%}
+                {{ '<|audio|>' }}
+            {%- elif item['type'] == 'image' -%}
+                {{ '<|image|>' }}
+            {%- elif item['type'] == 'video' -%}
+                {{ '<|video|>' }}
+            {%- elif item['type'] == 'text' -%}
+                {%- if role == "model" -%}
+                    {{ strip_thinking(item['text']) }}
+                {%- else -%}
+                    {{ item['text'] | trim }}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif not ns_tool.tool_calls -%}
+        {{ raise_exception("Invalid content type") }}
+    {%- endif -%}
+    {%- endset -%}
+    {{- captured_content -}}
+    {%- if not ns_tool.tool_calls -%}
+        {{ '<turn|>\n' }}
+    {%- elif not ns_tool.tool_response -%}
+        {{- '<|tool_response>' -}}
+    {%- elif ns_scan.next_role != 'assistant' and (captured_content | trim | length > 0 or ns_scan.next_role) -%}
+        {{- '<turn|>\n' -}}
+        {%- set ns_tool.tool_calls = false -%}
+    {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {%- if not ns_tool.tool_calls -%}
+    {{'<|turn>model\n'}}
+    {%- if not thinking -%}
+        {{ '<|channel>thought\n<channel|>' }}
+    {%- endif -%}
+    {%- elif ns_tool.tool_response and thinking -%}
+        {{- '<|channel>thought\n' -}}
+    {%- endif -%}
+{%- endif -%}
+"""
+
+CHAT_TEMPLATES["gemma-4-thinking"] = (gemma4_thinking_template, gemma4_template_eos_token, False, gemma4_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma-4-thinking"] = None
+
+CHAT_TEMPLATES["gemma4-thinking"] = (gemma4_thinking_template, gemma4_template_eos_token, False, gemma4_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gemma4-thinking"] = None
+
+# 26B-A4B / 31B generate after an empty thought channel their template omits from history; final-turn reasoning fills it.
+_gemma4_model_turn = "{{ '<|turn>' + role + '\n' }}\n"
+gemma4_empty_thought_template = gemma4_thinking_template.replace(
+    _gemma4_model_turn + "    {%- endif -%}\n",
+    _gemma4_model_turn + "    {%- endif -%}\n" + \
+"""    {%- if role == "model" -%}
+        {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
+        {%- if thinking_text and loop.index0 > ns_turn.last_user_idx -%}
+            {{ '<|channel>thought\n' + thinking_text + '\n<channel|>' }}
+        {%- elif not thinking and not continues -%}
+            {{ '<|channel>thought\n<channel|>' }}
+        {%- endif -%}
+    {%- endif -%}
+""",
+    1,
+).replace(
+    "{%- for message in loop_messages -%}",
+    "{%- set ns_turn = namespace(last_user_idx=-1) -%}\n"
+    "{%- for m in loop_messages -%}{%- if m['role'] == 'user' -%}{%- set ns_turn.last_user_idx = loop.index0 -%}{%- endif -%}{%- endfor -%}\n"
+    "{%- for message in loop_messages -%}",
+    1,
+)
+assert gemma4_empty_thought_template != gemma4_thinking_template
+# Ollama re-renders history each request, so every assistant turn gets the channel too.
+gemma4_empty_thought_ollama = '''
+FROM {__FILE_LOCATION__}
+TEMPLATE """{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 }}
+{{- if eq .Role "assistant" }}<|turn>model
+<|channel>thought
+<channel|>{{ .Content }}{{ if not $last }}<turn|>
+{{ end }}
+{{- else }}<|turn>{{ .Role }}
+{{ .Content }}<turn|>
+{{ if $last }}<|turn>model
+<|channel>thought
+<channel|>{{ end }}
+{{- end }}
+{{- end }}"""
+'''
+GEMMA4_TEMPLATE_NAMES = ("gemma-4", "gemma4", "gemma-4-thinking", "gemma4-thinking",)
+
+
+def _gemma4_wants_empty_thought(*holders):
+    # Content based: the model's own template primes the empty channel (E2B / E4B do not).
+    for holder in holders:
+        template = getattr(holder, "chat_template", None)
+        if isinstance(template, dict): template = template.get("default")
+        if not isinstance(template, str): continue
+        # Unsloth's gemma-4-thinking primes it for every size
+        if template.endswith(gemma4_thinking_template): continue
+        if "<|channel>thought\\n<channel|>" in template or "<|channel>thought\n<channel|>" in template:
+            return True
+    return False
+
+# Obtained via print(tokenizer.chat_template.replace("}\n", "####").replace("\n", "\\n").replace("####", "}\n"))
+# =========================================== GPT-OSS
+gptoss_template = \
+"""{#-
+  In addition to the normal inputs of `messages` and `tools`, this template also accepts the
+  following kwargs:
+  - "builtin_tools": A list, can contain "browser" and/or "python".
+  - "model_identity": A string that optionally describes the model identity.
+  - "reasoning_effort": A string that describes the reasoning effort, defaults to "medium".
+ #}
+
+{#- Tool Definition Rendering ============================================== #}
+{%- macro render_typescript_type(param_spec, required_params, is_nullable=false) -%}
+    {%- if param_spec.type == "array" -%}
+        {%- if param_spec['items'] -%}
+            {%- if param_spec['items']['type'] == "string" -%}
+                {{- "string[]" }}
+            {%- elif param_spec['items']['type'] == "number" -%}
+                {{- "number[]" }}
+            {%- elif param_spec['items']['type'] == "integer" -%}
+                {{- "number[]" }}
+            {%- elif param_spec['items']['type'] == "boolean" -%}
+                {{- "boolean[]" }}
+            {%- else -%}
+                {%- set inner_type = render_typescript_type(param_spec['items'], required_params) -%}
+                {%- if inner_type == "object | object" or inner_type|length > 50 -%}
+                    {{- "any[]" }}
+                {%- else -%}
+                    {{- inner_type + "[]" }}
+                {%- endif -%}
+            {%- endif -%}
+            {%- if param_spec.nullable -%}
+                {{- " | null" }}
+            {%- endif -%}
+        {%- else -%}
+            {{- "any[]" }}
+            {%- if param_spec.nullable -%}
+                {{- " | null" }}
+            {%- endif -%}
+        {%- endif -%}
+    {%- elif param_spec.type is defined and param_spec.type is iterable and param_spec.type is not string and param_spec.type is not mapping and param_spec.type[0] is defined -%}
+        {#- Handle array of types like ["object", "object"] from Union[dict, list] #}
+        {%- if param_spec.type | length > 1 -%}
+            {{- param_spec.type | join(" | ") }}
+        {%- else -%}
+            {{- param_spec.type[0] }}
+        {%- endif -%}
+    {%- elif param_spec.oneOf -%}
+        {#- Handle oneOf schemas - check for complex unions and fallback to any #}
+        {%- set has_object_variants = false -%}
+        {%- for variant in param_spec.oneOf -%}
+            {%- if variant.type == "object" -%}
+                {%- set has_object_variants = true -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if has_object_variants and param_spec.oneOf|length > 1 -%}
+            {{- "any" }}
+        {%- else -%}
+            {%- for variant in param_spec.oneOf -%}
+                {{- render_typescript_type(variant, required_params) -}}
+                {%- if variant.description %}
+                    {{- "// " + variant.description }}
+                {%- endif -%}
+                {%- if variant.default is defined %}
+                    {{ "// default: " + variant.default|tojson }}
+                {%- endif -%}
+                {%- if not loop.last %}
+                    {{- " | " }}
+                {% endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+    {%- elif param_spec.type == "string" -%}
+        {%- if param_spec.enum -%}
+            {{- '"' + param_spec.enum|join('" | "') + '"' -}}
+        {%- else -%}
+            {{- "string" }}
+            {%- if param_spec.nullable %}
+                {{- " | null" }}
+            {%- endif -%}
+        {%- endif -%}
+    {%- elif param_spec.type == "number" -%}
+        {{- "number" }}
+    {%- elif param_spec.type == "integer" -%}
+        {{- "number" }}
+    {%- elif param_spec.type == "boolean" -%}
+        {{- "boolean" }}
+
+    {%- elif param_spec.type == "object" -%}
+        {%- if param_spec.properties -%}
+            {{- "{\n" }}
+            {%- for prop_name, prop_spec in param_spec.properties.items() -%}
+                {{- prop_name -}}
+                {%- if prop_name not in (param_spec.required or []) -%}
+                    {{- "?" }}
+                {%- endif -%}
+                {{- ": " }}
+                {{ render_typescript_type(prop_spec, param_spec.required or []) }}
+                {%- if not loop.last -%}
+                    {{-", " }}
+                {%- endif -%}
+            {%- endfor -%}
+            {{- "}" }}
+        {%- else -%}
+            {{- "object" }}
+        {%- endif -%}
+    {%- else -%}
+        {{- "any" }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_tool_namespace(namespace_name, tools) -%}
+    {{- "## " + namespace_name + "\n\n" }}
+    {{- "namespace " + namespace_name + " {\n\n" }}
+    {%- for tool in tools %}
+        {%- set tool = tool.function %}
+        {{- "// " + tool.description + "\n" }}
+        {{- "type "+ tool.name + " = " }}
+        {%- if tool.parameters and tool.parameters.properties %}
+            {{- "(_: {\n" }}
+            {%- for param_name, param_spec in tool.parameters.properties.items() %}
+                {%- if param_spec.description %}
+                    {{- "// " + param_spec.description + "\n" }}
+                {%- endif %}
+                {{- param_name }}
+                {%- if param_name not in (tool.parameters.required or []) -%}
+                    {{- "?" }}
+                {%- endif -%}
+                {{- ": " }}
+                {{- render_typescript_type(param_spec, tool.parameters.required or []) }}
+                {%- if param_spec.default is defined -%}
+                    {%- if param_spec.enum %}
+                        {{- ", // default: " + param_spec.default }}
+                    {%- elif param_spec.oneOf %}
+                        {{- "// default: " + param_spec.default }}
+                    {%- else %}
+                        {{- ", // default: " + param_spec.default|tojson }}
+                    {%- endif -%}
+                {%- endif -%}
+                {%- if not loop.last %}
+                    {{- ",\n" }}
+                {%- else %}
+                    {{- ",\n" }}
+                {%- endif -%}
+            {%- endfor %}
+            {{- "}) => any;\n\n" }}
+        {%- else -%}
+            {{- "() => any;\n\n" }}
+        {%- endif -%}
+    {%- endfor %}
+    {{- "} // namespace " + namespace_name }}
+{%- endmacro -%}
+
+{%- macro render_builtin_tools(browser_tool, python_tool) -%}
+    {%- if browser_tool %}
+        {{- "## browser\n\n" }}
+        {{- "// Tool for browsing.\n" }}
+        {{- "// The `cursor` appears in brackets before each browsing display: `[{cursor}]`.\n" }}
+        {{- "// Cite information from the tool using the following format:\n" }}
+        {{- "// `【{cursor}†L{line_start}(-L{line_end})?】`, for example: `【6†L9-L11】` or `【8†L3】`.\n" }}
+        {{- "// Do not quote more than 10 words directly from the tool output.\n" }}
+        {{- "// sources=web (default: web)\n" }}
+        {{- "namespace browser {\n\n" }}
+        {{- "// Searches for information related to `query` and displays `topn` results.\n" }}
+        {{- "type search = (_: {\n" }}
+        {{- "query: string,\n" }}
+        {{- "topn?: number, // default: 10\n" }}
+        {{- "source?: string,\n" }}
+        {{- "}) => any;\n\n" }}
+        {{- "// Opens the link `id` from the page indicated by `cursor` starting at line number `loc`, showing `num_lines` lines.\n" }}
+        {{- "// Valid link ids are displayed with the formatting: `【{id}†.*】`.\n" }}
+        {{- "// If `cursor` is not provided, the most recent page is implied.\n" }}
+        {{- "// If `id` is a string, it is treated as a fully qualified URL associated with `source`.\n" }}
+        {{- "// If `loc` is not provided, the viewport will be positioned at the beginning of the document or centered on the most relevant passage, if available.\n" }}
+        {{- "// Use this function without `id` to scroll to a new location of an opened page.\n" }}
+        {{- "type open = (_: {\n" }}
+        {{- "id?: number | string, // default: -1\n" }}
+        {{- "cursor?: number, // default: -1\n" }}
+        {{- "loc?: number, // default: -1\n" }}
+        {{- "num_lines?: number, // default: -1\n" }}
+        {{- "view_source?: boolean, // default: false\n" }}
+        {{- "source?: string,\n" }}
+        {{- "}) => any;\n\n" }}
+        {{- "// Finds exact matches of `pattern` in the current page, or the page given by `cursor`.\n" }}
+        {{- "type find = (_: {\n" }}
+        {{- "pattern: string,\n" }}
+        {{- "cursor?: number, // default: -1\n" }}
+        {{- "}) => any;\n\n" }}
+        {{- "} // namespace browser\n\n" }}
+    {%- endif -%}
+
+    {%- if python_tool %}
+        {{- "## python\n\n" }}
+        {{- "Use this tool to execute Python code in your chain of thought. The code will not be shown to the user. This tool should be used for internal reasoning, but not for code that is intended to be visible to the user (e.g. when creating plots, tables, or files).\n\n" }}
+        {{- "When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 120.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is UNKNOWN. Depends on the cluster.\n\n" }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- System Message Construction ============================================ #}
+{%- macro build_system_message() -%}
+    {%- if model_identity is not defined %}
+        {%- set model_identity = "You are ChatGPT, a large language model trained by OpenAI." %}
+    {%- endif %}
+    {{- model_identity + "\n" }}
+    {{- "Knowledge cutoff: 2024-06\n" }}
+    {{- "Current date: " + strftime_now("%Y-%m-%d") + "\n\n" }}
+    {%- if reasoning_effort is not defined %}
+        {%- set reasoning_effort = "medium" %}
+    {%- endif %}
+    {{- "Reasoning: " + reasoning_effort + "\n\n" }}
+    {%- if builtin_tools is defined and builtin_tools is not none %}
+        {{- "# Tools\n\n" }}
+        {%- set available_builtin_tools = namespace(browser=false, python=false) %}
+        {%- for tool in builtin_tools %}
+            {%- if tool == "browser" %}
+                {%- set available_builtin_tools.browser = true %}
+            {%- elif tool == "python" %}
+                {%- set available_builtin_tools.python = true %}
+            {%- endif %}
+        {%- endfor %}
+        {{- render_builtin_tools(available_builtin_tools.browser, available_builtin_tools.python) }}
+    {%- endif -%}
+    {{- "# Valid channels: analysis, commentary, final. Channel must be included for every message." }}
+    {%- if tools -%}
+        {{- "\nCalls to these tools must go to the commentary channel: 'functions'." }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- Main Template Logic ================================================= #}
+{#- Set defaults #}
+
+{#- Render system message #}
+{{- "<|start|>system<|message|>" }}
+{{- build_system_message() }}
+{{- "<|end|>" }}
+
+{#- Extract developer message #}
+{%- if developer_instructions is defined and developer_instructions is not none %}
+    {%- set developer_message = developer_instructions %}
+    {%- set loop_messages = messages %}
+{%- elif messages[0].role == "developer" or messages[0].role == "system" %}
+    {%- set developer_message = messages[0].content %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set developer_message = "" %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+
+{#- Render developer message #}
+{%- if developer_message or tools %}
+    {{- "<|start|>developer<|message|>" }}
+    {%- if developer_message %}
+        {{- "# Instructions\n\n" }}
+        {{- developer_message }}
+    {%- endif %}
+    {%- if tools -%}
+        {%- if developer_message %}
+            {{- "\n\n" }}
+        {%- endif %}
+        {{- "# Tools\n\n" }}
+        {{- render_tool_namespace("functions", tools) }}
+    {%- endif -%}
+    {{- "<|end|>" }}
+{%- endif %}
+
+{#- Render messages #}
+{%- set last_tool_call = namespace(name=none) %}
+{%- for message in loop_messages -%}
+    {#- At this point only assistant/user/tool messages should remain #}
+    {%- if message.role == 'assistant' -%}
+        {#- Checks to ensure the messages are being passed in the format we expect #}
+        {%- if message.content is string %}
+            {%- if "<|channel|>analysis<|message|>" in message.content or "<|channel|>final<|message|>" in message.content %}
+                {{- raise_exception("You have passed a message containing <|channel|> tags in the content field. Instead of doing this, you should pass analysis messages (the string between '<|message|>' and '<|end|>') in the 'thinking' field, and final messages (the string between '<|message|>' and '<|end|>') in the 'content' field.") }}
+            {%- endif %}
+        {%- endif %}
+        {%- if message.thinking is string %}
+            {%- if "<|channel|>analysis<|message|>" in message.thinking or "<|channel|>final<|message|>" in message.thinking %}
+                {{- raise_exception("You have passed a message containing <|channel|> tags in the thinking field. Instead of doing this, you should pass analysis messages (the string between '<|message|>' and '<|end|>') in the 'thinking' field, and final messages (the string between '<|message|>' and '<|end|>') in the 'content' field.") }}
+            {%- endif %}
+        {%- endif %}
+        {%- if "tool_calls" in message %}
+            {#- We need very careful handling here - we want to drop the tool call analysis message if the model #}
+            {#- has output a later <|final|> message, but otherwise we want to retain it. This is the only case #}
+            {#- when we render CoT/analysis messages in inference. #}
+            {%- set future_final_message = namespace(found=false) %}
+            {%- for future_message in loop_messages[loop.index:] %}
+                {%- if future_message.role == 'assistant' and "tool_calls" not in future_message %}
+                    {%- set future_final_message.found = true %}
+                {%- endif %}
+            {%- endfor %}
+            {#- We assume max 1 tool call per message, and so we infer the tool call name #}
+            {#- in "tool" messages from the most recent assistant tool call name #}
+            {%- set tool_call = message.tool_calls[0] %}
+            {%- if tool_call.function %}
+                {%- set tool_call = tool_call.function %}
+            {%- endif %}
+            {%- if message.content and message.thinking %}
+                {{- raise_exception("Cannot pass both content and thinking in an assistant message with tool calls! Put the analysis message in one or the other, but not both.") }}
+            {%- elif message.content and not future_final_message.found %}
+                {{- "<|start|>assistant<|channel|>analysis<|message|>" + message.content + "<|end|>" }}
+            {%- elif message.thinking and not future_final_message.found %}
+                {{- "<|start|>assistant<|channel|>analysis<|message|>" + message.thinking + "<|end|>" }}
+            {%- endif %}
+            {{- "<|start|>assistant to=" }}
+            {{- "functions." + tool_call.name + "<|channel|>commentary " }}
+            {{- (tool_call.content_type if tool_call.content_type is defined else "json") + "<|message|>" }}
+            {%- if tool_call.arguments is string %}
+                {{- tool_call.arguments }}
+            {%- else %}
+                {{- tool_call.arguments|tojson }}
+            {%- endif %}
+            {{- "<|call|>" }}
+            {%- set last_tool_call.name = tool_call.name %}
+        {%- elif loop.last and not add_generation_prompt %}
+            {#- Only render the CoT if the final turn is an assistant turn and add_generation_prompt is false #}
+            {#- This is a situation that should only occur in training, never in inference. #}
+            {%- if message.thinking is string %}
+                {{- "<|start|>assistant<|channel|>analysis<|message|>" + message.thinking + "<|end|>" }}
+            {%- endif %}
+            {#- <|return|> indicates the end of generation, but <|end|> does not #}
+            {#- <|return|> should never be an input to the model, but we include it as the final token #}
+            {#- when training, so the model learns to emit it. #}
+            {{- "<|start|>assistant<|channel|>final<|message|>" + message.content + "<|return|>" }}
+        {%- elif message.thinking is string and message.content is not string %}
+            {#- A previous turn with only CoT and no final answer: keep the analysis message #}
+            {{- "<|start|>assistant<|channel|>analysis<|message|>" + message.thinking + "<|end|>" }}
+            {%- set last_tool_call.name = none %}
+        {%- else %}
+            {#- CoT is dropped during all previous turns, so we never render it for inference #}
+            {{- "<|start|>assistant<|channel|>final<|message|>" + message.content + "<|end|>" }}
+            {%- set last_tool_call.name = none %}
+        {%- endif %}
+    {%- elif message.role == 'tool' -%}
+        {%- if last_tool_call.name is none %}
+            {{- raise_exception("Message has tool role, but there was no previous assistant message with a tool call!") }}
+        {%- endif %}
+        {{- "<|start|>functions." + last_tool_call.name }}
+        {%- if message.content is string %}
+            {{- " to=assistant<|channel|>commentary<|message|>" + message.content + "<|end|>" }}
+        {%- else %}
+            {{- " to=assistant<|channel|>commentary<|message|>" + message.content|tojson + "<|end|>" }}
+        {%- endif %}
+    {%- elif message.role == 'user' -%}
+        {{- "<|start|>user<|message|>" + message.content + "<|end|>" }}
+    {%- endif -%}
+{%- endfor -%}
+
+{#- Generation prompt #}
+{%- if add_generation_prompt -%}
+<|start|>assistant
+{%- endif -%}"""
+
+# Ollama from https://ollama.com/library/gpt-oss
+gptoss_ollama = \
+'''
+FROM {__FILE_LOCATION__}
+TEMPLATE """<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.
+Knowledge cutoff: 2024-06
+Current date: {{ currentDate }}
+{{- if and .IsThinkSet .Think (ne .ThinkLevel "") }}
+
+Reasoning: {{ .ThinkLevel }}
+{{- else if or (not .IsThinkSet) (and .IsThinkSet .Think) }}
+
+Reasoning: medium
+{{- end }}
+
+{{- $hasNonBuiltinTools := false }}
+{{- if .Tools -}}
+{{- $hasBrowserSearch := false }}
+{{- $hasBrowserOpen := false }}
+{{- $hasBrowserFind := false }}
+{{- $hasPython := false }}
+  {{- range .Tools }}
+    {{- if eq .Function.Name "browser.search" -}}{{- $hasBrowserSearch = true -}}
+    {{- else if eq .Function.Name "browser.open" -}}{{- $hasBrowserOpen = true -}}
+    {{- else if eq .Function.Name "browser.find" -}}{{- $hasBrowserFind = true -}}
+    {{- else if eq .Function.Name "python" -}}{{- $hasPython = true -}}
+    {{- else }}{{ $hasNonBuiltinTools = true -}}
+    {{- end }}
+  {{- end }}
+{{- if or $hasBrowserSearch $hasBrowserOpen $hasBrowserFind $hasPython }}
+
+# Tools
+{{- if or $hasBrowserSearch $hasBrowserOpen $hasBrowserFind }}
+
+## browser
+
+// Tool for browsing.
+// The `cursor` appears in brackets before each browsing display: `[{cursor}]`.
+// Cite information from the tool using the following format:
+// `【{cursor}†L{line_start}(-L{line_end})?】`, for example: `【6†L9-L11】` or `【8†L3】`.
+// Do not quote more than 10 words directly from the tool output.
+// sources=web (default: web)
+namespace browser {
+{{- if $hasBrowserSearch }}
+
+// Searches for information related to `query` and displays `topn` results.
+type search = (_: {
+query: string,
+topn?: number, // default: 10
+source?: string,
+}) => any;
+{{- end }}
+{{- if $hasBrowserOpen }}
+
+// Opens the link `id` from the page indicated by `cursor` starting at line number `loc`, showing `num_lines` lines.
+// Valid link ids are displayed with the formatting: `【{id}†.*】`.
+// If `cursor` is not provided, the most recent page is implied.
+// If `id` is a string, it is treated as a fully qualified URL associated with `source`.
+// If `loc` is not provided, the viewport will be positioned at the beginning of the document or centered on the most relevant passage, if available.
+// Use this function without `id` to scroll to a new location of an opened page.
+type open = (_: {
+id?: number | string, // default: -1
+cursor?: number, // default: -1
+loc?: number, // default: -1
+num_lines?: number, // default: -1
+view_source?: boolean, // default: false
+source?: string,
+}) => any;
+{{- end }}
+{{- if $hasBrowserFind }}
+
+// Finds exact matches of `pattern` in the current page, or the page given by `cursor`.
+type find = (_: {
+pattern: string,
+cursor?: number, // default: -1
+}) => any;
+{{- end }}
+
+} // namespace browser
+{{- end }}{{/* end if has browser tools */}}
+{{- if $hasPython }}
+
+## python
+
+Use this tool to execute Python code in your chain of thought. The code will not be shown to the user. This tool should be used for internal reasoning, but not for code that is intended to be visible to the user (e.g. when creating plots, tables, or files).
+
+When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 120.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is UNKNOWN. Depends on the cluster.
+{{- end }}{{/* end if hasPython */}}
+{{- end }}{{/* end if has any built-in tools */}}
+{{- end }}{{/* end if .Tools */}}
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.{{ if $hasNonBuiltinTools }}
+Calls to these tools must go to the commentary channel: 'functions'.
+{{- end -}}<|end|>{{/* end of system */ -}}
+{{- if or $hasNonBuiltinTools .System -}}
+<|start|>developer<|message|>{{- if $hasNonBuiltinTools }}# Tools
+
+## functions
+
+namespace functions {
+{{- range .Tools }}
+{{- if not (or (eq .Function.Name "browser.search") (eq .Function.Name "browser.open") (eq .Function.Name "browser.find") (eq .Function.Name "python")) }}
+{{if .Function.Description }}
+// {{ .Function.Description }}
+{{- end }}
+{{- if and .Function.Parameters.Properties (gt (len .Function.Parameters.Properties) 0) }}
+type {{ .Function.Name }} = (_: {
+{{- range $name, $prop := .Function.Parameters.Properties }}
+{{- if $prop.Description }}
+  // {{ $prop.Description }}
+{{- end }}
+  {{ $name }}: {{ if gt (len $prop.Type) 1 }}{{ range $i, $t := $prop.Type }}{{ if $i }} | {{ end }}{{ $t }}{{ end }}{{ else }}{{ index $prop.Type 0 }}{{ end }},
+{{- end }}
+}) => any;
+{{- else }}
+type {{ .Function.Name }} = () => any;
+{{- end }}
+{{- end }}{{/* end if not browser tool */}}
+{{- end }}{{/* end of range .Tools */}}
+
+} // namespace functions
+{{- end }}{{/* end if hasNonBuiltinTools */}}
+{{- if .System}}
+
+# Instructions
+
+{{ .System }}
+{{- end -}}
+<|end|>
+{{- end -}}
+{{- /* Find the index of the last user message */ -}}
+{{- $lastUserIdx := -1 }}
+{{- $prefillingContent := false }}
+{{- $prefillingThinkingOnly := false }}
+{{- range $i, $msg := .Messages }}
+  {{- $last := eq (len (slice $.Messages $i)) 1 -}}
+  {{- if eq $msg.Role "user" }}
+    {{- $lastUserIdx = $i }}
+  {{- end -}}
+  {{- if and $last (eq $msg.Role "assistant") (gt (len $msg.Content) 0) }}
+    {{- $prefillingContent = true }}
+  {{- else if and $last (eq $msg.Role "assistant") (gt (len $msg.Thinking) 0) }}
+    {{- $prefillingThinkingOnly = true }}
+  {{- end }}
+{{- end -}}
+{{- /* Now render messages */ -}}
+{{- range $i, $msg := .Messages }}
+  {{- $last := eq (len (slice $.Messages $i)) 1 -}}
+  {{- if (ne $msg.Role "system") -}}
+    {{- if eq $msg.Role "tool" -}}
+      {{- if or (eq $msg.ToolName "python") (eq $msg.ToolName "browser.search") (eq $msg.ToolName "browser.open") (eq $msg.ToolName "browser.find") -}}
+        <|start|>{{ $msg.ToolName }} to=assistant<|message|>{{ $msg.Content }}<|end|>
+      {{- else -}}
+        <|start|>functions.{{ $msg.ToolName }} to=assistant<|message|>{{ $msg.Content }}<|end|>
+      {{- end -}}
+    {{- else if eq $msg.Role "assistant" -}}
+      {{- if and $msg.Thinking (gt $i $lastUserIdx) -}}{{- /* Show thinking only after last user message */ -}}
+      <|start|>assistant<|channel|>analysis<|message|>{{ $msg.Thinking }}{{- if not $prefillingThinkingOnly -}}<|end|>{{- end -}}
+      {{- end -}}
+      {{- if gt (len $msg.Content) 0 -}}
+        <|start|>assistant<|channel|>final<|message|>{{ $msg.Content }}{{- if not $prefillingContent -}}<|end|>{{- end -}}
+      {{- end -}}
+      {{- if gt (len $msg.ToolCalls) 0 -}}
+        {{- range $j, $toolCall := $msg.ToolCalls -}}
+          {{- $isBuiltin := or (eq $toolCall.Function.Name "python") (eq $toolCall.Function.Name "browser.search") (eq $toolCall.Function.Name "browser.open") (eq $toolCall.Function.Name "browser.find") -}}
+          <|start|>assistant<|channel|>{{ if $isBuiltin }}analysis{{ else }}commentary{{ end }} to={{ if not $isBuiltin}}functions.{{end}}{{ $toolCall.Function.Name }} <|constrain|>json<|message|>{{ $toolCall.Function.Arguments }}<|call|>
+        {{- end -}}
+      {{- end -}}
+    {{- else if eq $msg.Role "user" -}}
+      <|start|>{{ $msg.Role }}<|message|>{{ $msg.Content }}<|end|>
+    {{- end }}
+  {{- else }}
+  {{- end }}
+{{- end -}}
+{{- if not (or $prefillingContent $prefillingThinkingOnly) -}}
+<|start|>assistant
+{{- end -}}"""
+PARAMETER temperature 1.0
+PARAMETER top_k 0
+PARAMETER top_p 1.0
+'''
+
+gptoss_template_template_eos_token = "<|return|>"
+CHAT_TEMPLATES["gpt-oss"] = (gptoss_template, gptoss_template_template_eos_token, False, gptoss_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gpt-oss"] = None
+
+CHAT_TEMPLATES["gptoss"] = (gptoss_template, gptoss_template_template_eos_token, False, gptoss_ollama,)
+DEFAULT_SYSTEM_MESSAGE["gptoss"] = None
+
+# =========================================== Qwen3-Instruct
+qwen3_instruct_template = \
+'''{%- if tools %}
+    {{- '<|im_start|>system\\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\\n\\n' }}
+    {%- endif %}
+    {{- "# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\"name\\": <function-name>, \\"arguments\\": <args-json-object>}\\n</tool_call><|im_end|>\\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if reasoning_content %}
+                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\\n<tool_response>\\n' }}
+        {{- content }}
+        {{- '\\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\\n' }}
+{%- endif %}'''
+
+qwen3_template_eos_token = "<|im_end|>"
+CHAT_TEMPLATES["qwen3-instruct"] = (qwen3_instruct_template, qwen3_template_eos_token, False, _ollama_template("qwen3-instruct"),)
+DEFAULT_SYSTEM_MESSAGE["qwen3-instruct"] = None
+
+
+# =========================================== Qwen3-Thinking
+qwen3_thinking_template = \
+'''{%- if tools %}
+    {{- '<|im_start|>system\\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\\n\\n' }}
+    {%- endif %}
+    {{- "# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\"name\\": <function-name>, \\"arguments\\": <args-json-object>}\\n</tool_call><|im_end|>\\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\\n<tool_response>\\n' }}
+        {{- content }}
+        {{- '\\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}'''
+
+CHAT_TEMPLATES["qwen3-thinking"] = (
+    qwen3_thinking_template,
+    qwen3_template_eos_token,
+    False,
+    _ollama_template("qwen3-thinking"),
+)
+DEFAULT_SYSTEM_MESSAGE["qwen3-thinking"] = None
+
+
+# =========================================== Liquid-LFM2
+liquid_lfm2_template = \
+'''{{bos_token}}{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+' + message['content'] + '<|im_end|>' + '
+'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
+' }}{% endif %}'''
+
+liquid_lfm2_template_eos_token = "<|im_end|>"
+CHAT_TEMPLATES["lfm-2"] = (liquid_lfm2_template, liquid_lfm2_template_eos_token, False, None)
+DEFAULT_SYSTEM_MESSAGE["lfm-2"] = None
+CHAT_TEMPLATES["lfm-2.5"] = (liquid_lfm2_template, liquid_lfm2_template_eos_token, False, None)
+DEFAULT_SYSTEM_MESSAGE["lfm-2.5"] = None
+
+
+
+# =========================================== Starling-LM
+
+starling_template = \
+"""{{ bos_token }}
+{%- for message in messages %}
+    {{- 'GPT4 Correct ' + message['role'].title() + ': ' + message['content'] + '<|end_of_turn|>' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- 'GPT4 Correct Assistant:' }}
+{%- endif %}"""
+
+# Ollama from https://ollama.com/library/starling-lm:7b/blobs/4b21bfc435b4
+starling_ollama = _ollama_template("starling")
+
+starling_template_eos_token = "<|end_of_turn|>"
+CHAT_TEMPLATES["starling"] = (starling_template, starling_template_eos_token, False, starling_ollama)
+DEFAULT_SYSTEM_MESSAGE["starling"] = None
+
+
+
+# =========================================== Yi-chat
+
+yi_chat_template = \
+"""{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+' + message['content'] + '<|im_end|>' + '
+'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
+' }}{% endif %}"""
+
+# Ollama from https://ollama.com/library/yi:34b-chat/blobs/62fbfd9ed093
+yi_chat_ollama = _ollama_template("yi-chat")
+
+yi_chat_template_eos_token = "<|endoftext|>"
+CHAT_TEMPLATES["yi-chat"] = (yi_chat_template, yi_chat_template_eos_token, False, yi_chat_ollama)
+DEFAULT_SYSTEM_MESSAGE["yi-chat"] = None
+
+# Caller text is spliced into Jinja '...' / "..." literals: a bare quote closes the literal, a
+# backslash reads as an escape, and \r becomes \n before unescaping.
+def _escape_jinja_literal(text):
+    return text.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"').replace("\r", "\\r")
+
+
+def _change_system_message(template: str, type_chat_template: str, system_message: str = None):
+    # For predefined templates, check if default system message exists
+    default_system_message = DEFAULT_SYSTEM_MESSAGE.get(f"{type_chat_template}", None)
+
+    # Custom templates have no default but may carry a {system_message} placeholder; fill it before the
+    # no-default return below. A missing message here is an error.
+    if default_system_message is None and "{system_message}" in template:
+        if system_message is None:
+            raise ValueError("Unsloth: You need to provide a system message for custom templates.")
+        new_template = template.replace("{system_message}", system_message)
+        return new_template, system_message
+
+    if default_system_message is None:
+        if system_message is not None:
+            logger.warning_once(
+                f"Unsloth: You tried to change the system message for {type_chat_template}, "
+                "but it doesn't have a default system message. "
+                "You need to manually add the system message in your data."
+            )
+        return template, system_message
+
+    # For predefined templates with default system message
+    message_to_use = system_message if system_message is not None else default_system_message
+    # Predefined templates hold {system_message} inside a Jinja literal, so escape it; custom ones are
+    # filled verbatim, since their placeholder may sit in raw text.
+    new_template = template.replace("{system_message}", _escape_jinja_literal(message_to_use))
+
+    return new_template, message_to_use
 
 
 def get_chat_template(
@@ -860,45 +2461,80 @@ def get_chat_template(
     mapping = {"role" : "role", "content" : "content", "user" : "user", "assistant" : "assistant"},
     map_eos_token = True,
     system_message = None,
+    patch_saving = True,
+    use_zoo_tokenizer_patch = None,
 ):
     assert(type(map_eos_token) is bool)
+    import sys
+    _backend = getattr(sys.modules.get("unsloth"), "DEVICE_TYPE", None)
+    is_mlx_backend = _backend == "mlx"
+    # The CPU backend, like MLX, never loads the GPU model stack that models._utils / save pull in.
+    is_light_backend = _backend in ("mlx", "cpu")
+    if use_zoo_tokenizer_patch is None:
+        use_zoo_tokenizer_patch = is_light_backend
+
+    # mlx-lm's TokenizerWrapper._tokenizer is the HF tokenizer, not the Rust backend the vocab-edit
+    # paths below need; unwrap here, re-wrap before return.
+    _mlx_tokenizer_wrapper = None
+    if is_mlx_backend and tokenizer.__class__.__name__ == "TokenizerWrapper":
+        _inner_tokenizer = getattr(tokenizer, "_tokenizer", None)
+        if _inner_tokenizer is not None and hasattr(_inner_tokenizer, "is_fast"):
+            _mlx_tokenizer_wrapper = tokenizer
+            tokenizer = _inner_tokenizer
+
+    # Multimodal checkpoints (gemma-4-E2B, Llava, Qwen-VL, ...) load as a processor,
+    # which carries the text tokenizer in `.tokenizer` -- the same unwrap the save and
+    # loader paths do. Everything below needs the tokenizer itself: the processor never
+    # has the Rust backend the vocab edits use, nor, on MLX, a padding_side of its own.
+    # Match the processor type rather than the attribute: MistralCommonBackend is itself
+    # a tokenizer but also exposes its non-HF backend as `.tokenizer`.
+    _processor = None
+    if isinstance(tokenizer, ProcessorMixin):
+        _processor = tokenizer
+        tokenizer = tokenizer.tokenizer
+
+    # Bind after unwrapping: the pad/bos/unk restore below reads it, and a
+    # processor answers None for all three.
     old_tokenizer = tokenizer
 
     IS_GEMMA = False
     if tokenizer.__class__.__name__.startswith("Gemma"):
         if chat_template == "chatml": chat_template = "gemma_chatml"
         IS_GEMMA = True
-    pass
 
-    # We add a check for Llama-3
-    # if chat_template == "llama-3":
-    #     tokenizer._using_llama3_template = True
-    # else:
-    #     llama3_tokens = set(["<|end_header_id|>", "<|eot_id|>", "<|start_header_id|>"])
-    #     check_llama3_tokens = llama3_tokens & set(str(x) for x in tokenizer.added_tokens_decoder.values())
-    #     if len(check_llama3_tokens) == len(llama3_tokens):
-    #         tokenizer._using_llama3_template = True
-    #     pass
-    # pass
 
     # We first check if the tokenizer is a fast one. If not, we cannot convert this!
     is_fast_tokenizer = getattr(tokenizer, "is_fast", False)
     old_padding_side = tokenizer.padding_side
 
     same_padding_token = False
+    type_chat_template = None
 
     if type(chat_template) in (list, tuple,):
+        # For changing system message later Since it's not supported yet, we will raise an error first!
+        type_chat_template = chat_template[0].lower()
         chat_template, stop_word = chat_template
         assert(type(chat_template) is str)
         assert(type(stop_word) is str)
         ollama_modelfile = None
 
     elif type(chat_template) is str:
+        # For changing system message later
+        type_chat_template = chat_template.lower()
 
         chat_template, stop_word, yes_map_eos_token, ollama_modelfile = CHAT_TEMPLATES[chat_template]
 
-        # Check mapping to eos_token
-        if not map_eos_token and yes_map_eos_token: map_eos_token = True
+        if type_chat_template in GEMMA4_TEMPLATE_NAMES and \
+            _gemma4_wants_empty_thought(_processor, old_tokenizer):
+            logger.warning_once(
+                "Unsloth: This Gemma-4 model expects an empty thought channel on non-thinking turns. "\
+                "Adding <|channel>thought\\n<channel|> to assistant turns without thinking content."
+            )
+            chat_template = gemma4_empty_thought_template
+            ollama_modelfile = gemma4_empty_thought_ollama
+
+        # The template can veto the eos mapping, but it must not force it back on: map_eos_token = False is
+        # an explicit choice by the caller.
         if not yes_map_eos_token and map_eos_token: map_eos_token = False
 
         if type(stop_word) in (list, tuple,):
@@ -909,21 +2545,28 @@ def get_chat_template(
 
         assert(type(stop_word) is str)
 
-        # Check fast tokenizer
-        if not is_fast_tokenizer:
-            print(
-                "Unsloth: Not a fast tokenizer, so can't process it as of yet :(\n"\
-                "Please log a Github issue if you want this as a new feature!\n"\
-                "Your chat template will still work, but it won't add or edit tokens."
+        # gemma_chatml / gemma2_chatml build <|im_end|> by renaming <eos> whether or not the caller opts
+        # out, while the rebuilt tokenizer carries eos_token = stop_word only when the mapping is on, so
+        # honouring the opt-out lets the class default re-add <eos> past the end of the embeddings. Key on
+        # the mapping, or a Gemma checkpoint whose eos_token is <end_of_turn> slips through.
+        if not map_eos_token and yes_map_eos_token and token_mapping is not None:
+            logger.warning_once(
+                f"Unsloth: {type_chat_template} builds {stop_word} by renaming existing "\
+                f"tokens, so map_eos_token = False cannot be honored here."
             )
+            map_eos_token = True
+
+        if not is_fast_tokenizer:
+            pass
 
         elif token_mapping is not None:
-            # token_mapping = {"<start_of_turn>" : "<|im_start|>", "<end_of_turn>" : "<|im_end|>"}
-            # For Gemma :)
 
             string_vocab = tokenizer._tokenizer.to_str()
 
             skipped = 0
+            # Only mirror applied mappings into the spm model; a skipped one would rename a piece the JSON never
+            # changed and desync the two.
+            applied_mapping = {}
             for old_token, new_token in token_mapping.items():
                 old_count = string_vocab.count(f'"{old_token}"')
                 new_count = string_vocab.count(f'"{new_token}"')
@@ -934,6 +2577,7 @@ def get_chat_template(
                     raise RuntimeError(f"{old_token} was not part of the tokenizer!")
                 else:
                     string_vocab = string_vocab.replace(f'"{old_token}"', f'"{new_token}"')
+                    applied_mapping[old_token] = new_token
                 pass
             pass
 
@@ -967,19 +2611,17 @@ def get_chat_template(
                 pass
 
                 # Must fix the sentence piece tokenizer since there's no tokenizer.model file!
-                tokenizer = fix_sentencepiece_tokenizer(tokenizer, new_tokenizer, token_mapping,)
+                from .tokenizer_utils import fix_sentencepiece_tokenizer
+                tokenizer = fix_sentencepiece_tokenizer(tokenizer, new_tokenizer, applied_mapping,)
             else:
                 pass
 
         elif map_eos_token and (stop_word != "eos_token"):
             logger.warning_once(f"Unsloth: Will map {stop_word} to EOS = {tokenizer.eos_token}.")
 
-            # Replaces the old EOS token with a new one.
-            # Useful for ChatML <|im_end|> for example.
-            # Usually we train 2 more tokens <|im_start|> and <|im_end|>
-            # But training the lm_head and embeddings are slow!
-            # This is a HACK!
-            # Idea from https://huggingface.co/cognitivecomputations/dolphin-2.6-mistral-7b-dpo-laser
+            # Replace the old EOS with a new one (e.g. ChatML <|im_end|>) to avoid slow lm_head/embedding
+            # retraining of new tokens. Idea from
+            # huggingface.co/cognitivecomputations/dolphin-2.6-mistral-7b-dpo-laser
 
             old_bos_token = getattr(tokenizer, "bos_token", None)
             old_eos_token = getattr(tokenizer, "eos_token", None)
@@ -989,13 +2631,15 @@ def get_chat_template(
             string_vocab = tokenizer._tokenizer.to_str()
             # First check if new stop_word is in the tokenizer
             if stop_word in string_vocab:
-                # We shall swap them around
                 temporary_stop_token = "<|:__TEMP//STOP//TOKEN__:|>"
                 string_vocab = string_vocab.replace(old_eos_token, temporary_stop_token)
                 string_vocab = string_vocab.replace(stop_word, old_eos_token)
                 string_vocab = string_vocab.replace(temporary_stop_token, stop_word)
+                # JSON swapped both, so swap both here too; a one-way map leaves two stop_word pieces.
+                sentencepiece_mapping = { old_eos_token : stop_word, stop_word : old_eos_token, }
             else:
                 string_vocab = string_vocab.replace(old_eos_token, stop_word)
+                sentencepiece_mapping = { old_eos_token : stop_word, }
             pass
             new_tokenizer = tokenizer._tokenizer.from_str(string_vocab)
 
@@ -1014,8 +2658,8 @@ def get_chat_template(
             )
 
             # Must fix the sentence piece tokenizer since there's no tokenizer.model file!
-            token_mapping = { old_eos_token : stop_word, }
-            tokenizer = fix_sentencepiece_tokenizer(tokenizer, new_tokenizer, token_mapping,)
+            from .tokenizer_utils import fix_sentencepiece_tokenizer
+            tokenizer = fix_sentencepiece_tokenizer(tokenizer, new_tokenizer, sentencepiece_mapping,)
         pass
 
     else:
@@ -1023,35 +2667,41 @@ def get_chat_template(
             f"Unsloth: `chat_template` must be a tuple of (your_template, eos_token,) or one of\n"\
             f"{CHAT_TEMPLATES.keys()}"
         )
-    pass
 
-    # Careful on Gemma
-    # bos_token is a must or else losses become too high
+    # bos_token is a must on Gemma or losses become too high.
     if IS_GEMMA and not chat_template.startswith(("{{ bos_token }}", "{{- bos_token }}")):
         chat_template = "{{ bos_token }}" + chat_template
-    pass
 
-    # For ShareGPT role -> from and content -> value
-    new_chat_template = chat_template\
-        .replace("'role'",      "'" + mapping["role"]      + "'")\
-        .replace("'content'",   "'" + mapping["content"]   + "'")\
-        .replace("'user'",      "'" + mapping["user"]      + "'")\
-        .replace("'assistant'", "'" + mapping["assistant"] + "'")
-
+    if use_zoo_tokenizer_patch:
+        # Unsloth MLX avoids the model-utils tokenizer wrapper: that import path pulls Torch/GPU-specific
+        # modules in before MLX training.
+        from unsloth_zoo.tokenizer_utils import patch_tokenizer
+    else:
+        from .models._utils import patch_tokenizer
     _, tokenizer = patch_tokenizer(model = None, tokenizer = tokenizer)
     tokenizer.padding_side = old_padding_side
 
     # If not normal HF, we add a check to make old templates work
     if mapping != {"role" : "role", "content" : "content", "user" : "user", "assistant" : "assistant"}:
+        role, content, user, assistant = (
+            "'" + _escape_jinja_literal(mapping[key]) + "'"
+            for key in ("role", "content", "user", "assistant")
+        )
         chat_template = \
-            "{% if 'role' in messages[0] %}" + \
-            chat_template + \
-            "{% else %}" + \
-            new_chat_template + \
-            "{% endif %}"
-    else:
-        chat_template = new_chat_template
-    pass
+            "{%- if 'role' not in messages[0] -%}" + \
+            "{%- set sharegpt = namespace(messages = []) -%}" + \
+            "{%- for message in messages -%}" + \
+            "{%- set role = {" + user + " : 'user', " + assistant + " : 'assistant'}" + \
+            ".get(message[" + role + "], message[" + role + "]) -%}" + \
+            "{%- set sharegpt.messages = sharegpt.messages + " + \
+            "[dict(message, role = role, content = message[" + content + "])] -%}" + \
+            "{%- endfor -%}" + \
+            "{%- set messages = sharegpt.messages -%}" + \
+            "{%- endif %}" + \
+            chat_template
+
+    chat_template, system_message = _change_system_message(chat_template, type_chat_template, system_message)
+
     tokenizer.chat_template = chat_template
 
     # Also fix up other tokens
@@ -1065,32 +2715,63 @@ def get_chat_template(
     if old_unk_token != new_unk_token: tokenizer.unk_token = old_unk_token
     if not same_padding_token:
         if old_pad_token != new_pad_token: tokenizer.pad_token = old_pad_token
-    pass
 
-    # stopping_criteria = create_stopping_criteria(tokenizer, stop_word)
 
-    # Patch saving functions
-    tokenizer = patch_saving_functions(tokenizer)
+    # Hand the processor back, not the tokenizer it was carrying: it renders chat
+    # templates off its own attribute, and the vocab edits above may have rebuilt the
+    # tokenizer and remapped eos. The loader mirrors these onto the processor
+    # (models/vision.py), so refresh them here or that copy goes stale.
+    if _processor is not None:
+        # GGUF export unwraps the processor before it builds the Ollama Modelfile.
+        tokenizer._ollama_modelfile = ollama_modelfile
+        _processor.tokenizer = tokenizer
+        _processor.chat_template = chat_template
+        for _token in ("bos_token", "eos_token", "pad_token",):
+            if hasattr(tokenizer, _token):
+                setattr(_processor, _token, getattr(tokenizer, _token))
+                setattr(_processor, _token + "_id", getattr(tokenizer, _token + "_id"))
+        tokenizer = _processor
 
-    # Add Ollama
+    if patch_saving and not is_light_backend:
+        from .save import patch_saving_functions
+        tokenizer = patch_saving_functions(tokenizer, vision = _processor is not None)
+
     tokenizer._ollama_modelfile = ollama_modelfile
     tokenizer._system_message   = system_message
-    return tokenizer#, stopping_criteria
-pass
+
+    # Re-wrap so the trainer gets the same TokenizerWrapper type back.
+    if _mlx_tokenizer_wrapper is not None:
+        _mlx_tokenizer_wrapper._tokenizer = tokenizer
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            _mlx_tokenizer_wrapper._eos_token_ids = {eos_token_id}
+        _mlx_tokenizer_wrapper._chat_template = None
+        _mlx_tokenizer_wrapper.has_chat_template = (
+            getattr(tokenizer, "chat_template", None) is not None
+        )
+        tokenizer = _mlx_tokenizer_wrapper
+    return enable_tokenizers_v1(tokenizer)
 
 
 def remove_special_tokens(tokenizer, prompt):
     # Removes double BOS token
-    if prompt.startswith(tokenizer.bos_token):
-        prompt = prompt[len(tokenizer.bos_token):]
-    pass
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if bos_token is not None and prompt.startswith(bos_token):
+        prompt = prompt[len(bos_token):]
     return prompt
-pass
+
+
+# The prompt is rendered with str.format, so `{{` / `}}` are literal braces, not columns.
+_ESCAPED_BRACES_RE = re.compile(r"\{\{|\}\}")
+_COLUMN_RE = re.compile(r"\{(.+?)\}")
+
+
+def _column_names_in(text):
+    return _COLUMN_RE.findall(_ESCAPED_BRACES_RE.sub("", text))
 
 
 def _parse_combined_prompt(combined_prompt, dataset):
-    # Find {...}
-    possible_columns = re.findall(r"\{(.+?)\}", combined_prompt)
+    possible_columns = _column_names_in(combined_prompt)
     dataset_columns = set(dataset.column_names)
     for column in possible_columns:
         if column not in dataset_columns:
@@ -1098,83 +2779,94 @@ def _parse_combined_prompt(combined_prompt, dataset):
                 f"Unsloth: Your prompt includes '{column}' but this does not exist in the dataset. "\
                 f"Only allowed columns are {list(dataset_columns)}"
             )
-        pass
-    pass
 
-    # Find [[...]]
     optional_prompts = list(re.finditer(r"\[\[.+?\]\]", combined_prompt, flags = re.DOTALL | re.MULTILINE))
     optional_prompts = [(x.span(), x.group(0)) for x in optional_prompts]
 
     final_optional_prompts = []
     if len(optional_prompts) != 0:
-        # Add left
         left = optional_prompts[0]
         l = left[0][0]
         if l != 0: final_optional_prompts.append(combined_prompt[:l])
 
-        # Add in between
         for left, right in zip(optional_prompts[:-1], optional_prompts[1:]):
             l, r = left[0][-1], right[0][0]
             final_optional_prompts.append(left)
             if l != r: final_optional_prompts.append(combined_prompt[l : r])
-        pass
         final_optional_prompts.append(optional_prompts[-1])
 
-        # Add right
         right = optional_prompts[-1]
         r = right[0][1]
         if r != len(combined_prompt): final_optional_prompts.append(combined_prompt[r:])
     else:
-        # Just add in the entire string
         final_optional_prompts.append(combined_prompt)
-    pass
 
     check_combined = "".join(x if type(x) is str else x[1] for x in final_optional_prompts)
     assert(combined_prompt == check_combined)
 
     return possible_columns, final_optional_prompts
-pass
 
 
 def _create_formatter(possible_columns, final_optional_prompts, user_column_name):
-    # Start final prompt!
-    function = ["def __combined_prompt_processor__(examples):"]
-    columns = list(set(possible_columns))
-    for column in columns:
-        function.append(f"{' '*4}{column}__ = examples['{column}']")
-    function.append(f"{' '*4}texts = []")
-    function.append(f"{' '*4}for ({', '.join(columns)}) in zip({', '.join(f'{x}__' for x in columns)}):")
-
-    # Add optional tags as well!
-    final_prompt = ""
-    formatter = []
+    columns = list(dict.fromkeys(possible_columns))
+    merged_prompt_parts = []
+    formatter_templates = []
 
     for j, optional_prompt in enumerate(final_optional_prompts):
         if type(optional_prompt) is str:
-            columns = re.findall(r"\{(.+?)\}", optional_prompt)
-            formatter += columns
-            # Must escape \n \r
-            final_prompt += optional_prompt.encode("unicode-escape").decode("utf-8").replace("'", "\\'").replace('"', '\\"')
-        else:
-            where, prompt = optional_prompt
-            # Strip [[...]]
-            # Must escape \n \r
-            prompt = prompt[2:-2].encode("unicode-escape").decode("utf-8").replace("'", "\\'").replace('"', '\\"')
-            columns = re.findall(r"\{(.+?)\}", prompt)
-            x = f"__optional_{j}__"
-            prompt = f"{' '*8}{x} = '{prompt}'.format({', '.join(f'{x} = {x}' for x in columns)}) if {columns[0]} else ''"
-            function.append(prompt)
-            formatter.append(x)
-            final_prompt += "{" + x + "}"
-        pass
-    pass
+            needed_columns = _column_names_in(optional_prompt)
+            formatter_templates.append(("required", optional_prompt, needed_columns))
+            merged_prompt_parts.append(optional_prompt)
+            continue
 
-    function.insert(1, f"{' '*4}__combined_prompt__ = '{final_prompt}'")
-    function.append(f"{' '*8}texts.append("\
-                    f"__combined_prompt__.format({', '.join(f'{x} = {x}' for x in formatter)}))")
-    function.append(f"{' '*4}return " + "{ " + f"'{user_column_name}' : texts" + " }")
-    return "\n".join(function)
-pass
+        _, prompt = optional_prompt
+        prompt = prompt[2:-2]
+        needed_columns = _column_names_in(prompt)
+        if len(needed_columns) == 0:
+            raise IndexError("Unsloth: Optional [[...]] blocks must contain at least 1 {column}.")
+        optional_name = f"__optional_{j}__"
+        formatter_templates.append(("optional", optional_name, prompt, needed_columns))
+        merged_prompt_parts.append("{" + optional_name + "}")
+
+    merged_prompt = "".join(merged_prompt_parts)
+
+    def __combined_prompt_processor__(examples):
+        if len(examples) == 0:
+            return {user_column_name: []}
+
+        first_key = next(iter(examples.keys()), None)
+        if first_key is None:
+            return {user_column_name: []}
+        n_rows = len(examples[first_key])
+
+        texts = []
+        for row_idx in range(n_rows):
+            # Coerce missing (None) columns to "" so they do not render as the literal string "None".
+            row_values = {
+                column: ("" if (value := examples[column][row_idx]) is None else value)
+                for column in columns
+            }
+            formatter_values = {}
+
+            for formatter_template in formatter_templates:
+                if formatter_template[0] == "required":
+                    _, _, needed_columns = formatter_template
+                    for column in needed_columns:
+                        formatter_values[column] = row_values[column]
+                    continue
+
+                _, optional_name, prompt, needed_columns = formatter_template
+                if row_values[needed_columns[0]] != "":
+                    prompt_values = {column: row_values[column] for column in needed_columns}
+                    formatter_values[optional_name] = prompt.format(**prompt_values)
+                else:
+                    formatter_values[optional_name] = ""
+
+            texts.append(merged_prompt.format(**formatter_values))
+
+        return {user_column_name: texts}
+
+    return __combined_prompt_processor__
 
 
 def to_sharegpt(
@@ -1187,53 +2879,59 @@ def to_sharegpt(
     random_state = 3407,
 ):
     """
-    Converts a dataset to ShareGPT style.
-    ShareGPT requires only 1 input and 1 output field.
-    This means one has to merge multiple columns into 1 for 1 input field.
-    Use `conversation_extension` to increase the length of each conversation by randomnly
-    selecting a few and packing them into 1.
+    Converts a dataset to ShareGPT style (1 input + 1 output field).
+    Merge multiple columns into 1 input via `merged_prompt`; use
+    `conversation_extension` to pack several convos into one.
 
     merged_prompt = "",                 Prompt to merge columns into 1 input
     merged_column_name = "instruction", Final column name for the input  field
     output_column_name = "output",      Final column name for the output field
-    remove_unused_columns = True,
-    conversation_extension = 1,         Automatically combines `conversation_extension` convos into 1
-    random_state = 3407,
+    conversation_extension = 1,         Combines this many convos into 1
     """
     if "conversations" in dataset.column_names:
         convo = dataset[0]["conversations"]
         if type(convo) is list:
             raise TypeError("Unsloth: Your dataset is probably already in ShareGPT format!")
-        pass
-    pass
 
-    possible_columns, final_optional_prompts = _parse_combined_prompt(merged_prompt, dataset)
-    function = _create_formatter(possible_columns, final_optional_prompts, merged_column_name)
-    exec(function, globals())
-    dataset = dataset.map(__combined_prompt_processor__, batched = True, desc = "Merging columns")
+    if merged_prompt:
+        possible_columns, final_optional_prompts = _parse_combined_prompt(merged_prompt, dataset)
+        formatter = _create_formatter(possible_columns, final_optional_prompts, merged_column_name)
+        dataset = dataset.map(formatter, batched = True, desc = "Merging columns")
+    elif merged_column_name not in dataset.column_names:
+        # Without a merged_prompt there is nothing to build the input from. Running the formatter anyway
+        # would fill merged_column_name with empty strings and silently blank every human turn.
+        raise KeyError(
+            f"Unsloth: `to_sharegpt` needs an input column named '{merged_column_name}', "
+            f"but the dataset has {dataset.column_names}. Pass `merged_column_name` to "
+            "name the existing column, or `merged_prompt` to build the input from several."
+        )
 
     def __convert_to_sharegpt__(examples):
         users      = examples[merged_column_name]
         assistants = examples[output_column_name]
+        if len(users) != len(assistants):
+            raise ValueError(
+                "Unsloth: Input and output columns must have matching batch lengths. "
+                f"Got {len(users)} {merged_column_name} rows and {len(assistants)} {output_column_name} rows."
+            )
+        # A null cell is an absent value, not the word "None": _create_formatter coalesces it on the merged
+        # path, and the output column never went through that path at all.
         texts = [
             [
-                {"from" : "human", "value" : str(user)     },
-                {"from" : "gpt",   "value" : str(assistant)},
+                {"from" : "human", "value" : "" if user      is None else str(user)     },
+                {"from" : "gpt",   "value" : "" if assistant is None else str(assistant)},
             ] \
             for user, assistant in zip(users, assistants)
         ]
         return { "conversations" : texts, }
-    pass
 
     dataset = dataset.map(
         __convert_to_sharegpt__,
         batched = True,
         desc = "Converting to ShareGPT",
-        # Remove unused columns!
         remove_columns = dataset.column_names if remove_unused_columns else None,
     )
 
-    # Randomnly concat conversations to create a long stream!
     from datasets import concatenate_datasets
     n_extensions = max(conversation_extension-1, 0)
     if n_extensions == 0: return dataset
@@ -1242,153 +2940,69 @@ def to_sharegpt(
     all_shuffled = [dataset]
     for j in range(1, n_extensions+1):
         shuffled = dataset.shuffle(seed = random_state+j).rename_columns({"conversations0" : f"conversations{j}"})
-        all_shuffled.append(shuffled)
-    pass
+        # Kept caller columns live on copy 0; repeating them makes axis=1 concat fail.
+        all_shuffled.append(shuffled.select_columns([f"conversations{j}"]))
     dataset = concatenate_datasets(all_shuffled, axis = 1)
 
-    # Combine them into 1
-    function = "def __combine_conversations__(examples):\n"
     n_extensions += 1
-    for j in range(n_extensions):
-        function += f"{' '*4}conversations{j}__ = examples['conversations{j}']\n"
-    function += f"{' '*4}convos = []\n"
-    function += f"{' '*4}for ({', '.join(f'conversations{j}' for j in range(n_extensions))}) "\
-                f"in zip({', '.join(f'conversations{j}__' for j in range(n_extensions))}):\n"
-    function += f"{' '*8}convos.append("\
-                f"{'+'.join(f'conversations{j}' for j in range(n_extensions))})\n"
-    function += f"{' '*4}return " + "{ " + "'conversations' : convos" + " }"
+    conversation_columns = [f"conversations{j}" for j in range(n_extensions)]
+    def __combine_conversations__(examples):
+        columns = [examples[column] for column in conversation_columns]
+        convos = []
+        for conversations in zip(*columns):
+            merged_conversation = []
+            for conversation in conversations:
+                merged_conversation.extend(conversation)
+            convos.append(merged_conversation)
+        return {"conversations" : convos}
 
-    # Map function
-    exec(function, globals())
     dataset = dataset.map(
         __combine_conversations__,
         batched = True,
         desc = "Extending conversations",
-        # Remove unused columns!
-        remove_columns = dataset.column_names if remove_unused_columns else None,
+        remove_columns = dataset.column_names if remove_unused_columns else conversation_columns,
     )
     return dataset
-pass
-
-
-def standardize_sharegpt(
-    dataset,
-    aliases_for_system    = ["system",],
-    aliases_for_user      = ["user", "human", "input",],
-    aliases_for_assistant = ["gpt", "assistant", "output",],
-):
-    """
-    Standardizes ShareGPT and other formats to user/assistant Hugging Face format.
-    
-    Get aliases for the system, user and assistant roles.
-    These shall map to "system", "user" and "assistant" respectively.
-    
-    aliases_for_system    = ["system",],
-    aliases_for_user      = ["user", "human", "input",],
-    aliases_for_assistant = ["gpt", "assistant", "output",],
-    """
-    import collections
-    import itertools
-
-    convos = dataset[:10]["conversations"]
-    uniques = collections.defaultdict(list)
-    for convo in convos:
-        for message in convo:
-            for key, value in message.items():
-                uniques[key].append(value)
-    pass
-
-    # Must be only 2 entries
-    assert(len(uniques.keys()) == 2)
-
-    keys = list(uniques.keys())
-    length_first  = len(set(uniques[keys[0]]))
-    length_second = len(set(uniques[keys[1]]))
-
-    if length_first < length_second:
-        # Role is assigned to the first element
-        role_key    = keys[0]
-        content_key = keys[1]
-    else:
-        role_key    = keys[1]
-        content_key = keys[0]
-    pass
-
-    # Check roles are in aliases
-    all_aliases = set(aliases_for_system + aliases_for_user + aliases_for_assistant)
-    roles = set(uniques[role_key])
-    leftover_aliases = (all_aliases | roles) - all_aliases
-    if len(leftover_aliases) != 0:
-        raise TypeError(
-            f"Unsloth: {list(leftover_aliases)} are not in aliases. Please update aliases."
-        )
-    pass
-
-    # Mapping for aliases
-    aliases_mapping = {}
-    for x in aliases_for_system:    aliases_mapping[x] = "system"
-    for x in aliases_for_user:      aliases_mapping[x] = "user"
-    for x in aliases_for_assistant: aliases_mapping[x] = "assistant"
-
-    def _standardize_dataset(examples):
-        convos = examples["conversations"]
-        all_convos = []
-        for convo in convos:
-            new_convo = [
-                { "role" : aliases_mapping[message[role_key]], "content" : message[content_key], }
-                for message in convo
-            ]
-            all_convos.append(new_convo)
-        pass
-        return { "conversations" : all_convos, }
-    pass
-
-    return dataset.map(_standardize_dataset, batched = True, desc = "Standardizing format")
-pass
 
 
 def get_ollama_eos_tokens(tokenizer, extra_eos_tokens = []):
     added_tokens_decoder = tokenizer.added_tokens_decoder.values()
     added_tokens_decoder = [str(x) for x in added_tokens_decoder]
 
-    # Remove added_tokens_decoder duplicates
-    added_tokens_decoder = list(set(added_tokens_decoder) - set(extra_eos_tokens))
+    # Longest first, never through a set: the collapse below rewrites joined_text as it goes,
+    # so a family member must be seen before any shorter token sharing its prefix (`<unused0>`
+    # before `<unk>`), and set() order over strings varies with PYTHONHASHSEED.
+    skip_eos_tokens = set(extra_eos_tokens)
+    added_tokens_decoder = sorted(
+        (x for x in dict.fromkeys(added_tokens_decoder) if x not in skip_eos_tokens),
+        key = len,
+        reverse = True,
+    )
 
     # Remove BOS
     if getattr(tokenizer, "bos_token", None) is not None:
         added_tokens_decoder = [x for x in added_tokens_decoder if x != tokenizer.bos_token]
-    pass
 
-    repeatted_tokens = []
-    # Join all vocab
+    repeated_tokens = []
     joined_text = "\x01\x00".join(added_tokens_decoder)
     for token in added_tokens_decoder:
         n = len(token)
-        repeatted_counts = joined_text.count(token[:n//2])
-        # Try finding longer than 1/2 of the token in the rest
-        # For eg <|reserved_special_token_0|>, <|reserved_special_token_1|>
-        if repeatted_counts > 2:
+        repeated_counts = joined_text.count(token[:n//2])
+        # Longer than half the token, for e.g. <|reserved_special_token_0|> vs <|reserved_special_token_1|>.
+        if repeated_counts > 2:
             for j in range(n//2+1, n):
-                if joined_text.count(token[:j]) < repeatted_counts:
+                if joined_text.count(token[:j]) < repeated_counts:
                     j -= 1
-                    # Remove repeatted tokens to reduce search space
+                    # Remove repeated tokens to reduce search space
                     joined_text = joined_text.replace(token[:j], "")
-                    repeatted_tokens.append(token[:j])
+                    repeated_tokens.append(token[:j])
                     break
-            pass
-        pass
-    pass
 
-    # Remove duplicates
-    splitted = joined_text.split("\x01\x00")
-    final_eos_tokens = []
-    for old, new in zip(added_tokens_decoder, splitted):
-        if old == new: final_eos_tokens.append(old)
-    pass
+    split = joined_text.split("\x01\x00")
+    final_eos_tokens = [old for old, new in zip(added_tokens_decoder, split) if old == new]
     final_eos_tokens += extra_eos_tokens
-    final_eos_tokens += repeatted_tokens
+    final_eos_tokens += repeated_tokens
 
-    # Remove new lines, spaces and HTML tags
     filtered_eos_tokens = []
     for token in final_eos_tokens:
         if   token.count("\n") == len(token): continue
@@ -1396,9 +3010,7 @@ def get_ollama_eos_tokens(tokenizer, extra_eos_tokens = []):
         elif token.startswith("<") and len(token) <= 2: continue
         elif token.startswith("</") and len(token) == 3: continue
         filtered_eos_tokens.append(token)
-    pass
     return filtered_eos_tokens
-pass
 
 
 def construct_chat_template( \
@@ -1416,34 +3028,42 @@ chat_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 {INPUT}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 {OUTPUT}<|eot_id|>""",
-    
+
 default_system_message = \
     "Below are some instructions that describe some tasks. Write responses that appropriately complete each request.",
 
 extra_eos_tokens = None,
 ):
     """
-    Creates a Ollama modelfile and a HF Jinja template from a custom
+    Creates an Ollama modelfile and a HF Jinja template from a custom
     template. You must provide 2x examples of an input & output.
     There is an optional system message as well.
 
     You must use {INPUT}, {OUTPUT} twice, and {SYSTEM} is optional.
     """
-    # Strip only the left
+    # Strip only the left: trailing whitespace can be part of the repeated example (e.g. "{OUTPUT}\n").
+    # Accidental trailing whitespace (#992) is retried on failure.
     chat_template = chat_template.lstrip()
 
     assert(tokenizer is not None)
 
+    # A multimodal checkpoint hands over a processor, which carries the text tokenizer
+    # in `.tokenizer`. Everything below is tokenizer-shaped -- get_vocab, name_or_path,
+    # calling it on a string -- and this returns a template, never the tokenizer, so
+    # unwrap one way and there is nothing to re-attach. Match ProcessorMixin explicitly:
+    # tokenizer backends such as MistralCommonBackend also expose `.tokenizer`.
+    if isinstance(tokenizer, ProcessorMixin):
+        tokenizer = tokenizer.tokenizer
+
     if extra_eos_tokens is None: extra_eos_tokens = []
     elif type(extra_eos_tokens) is str: extra_eos_tokens = [extra_eos_tokens,]
+    original_extra_eos_tokens = list(extra_eos_tokens)
 
     vocab = tokenizer.get_vocab()
     for extra_eos in extra_eos_tokens:
         assert(type(extra_eos) is str)
         if extra_eos not in vocab:
             raise ValueError(f"Unsloth: `{extra_eos}` is not a singular token in the tokenizer.")
-        pass
-    pass
 
     error_msg = \
         "Unsloth: Your prompt template must have 2 examples showing the user input {INPUT} "\
@@ -1461,33 +3081,29 @@ extra_eos_tokens = None,
         raise RuntimeError(
             "Unsloth: Your tokenizer does not have an EOS token? Please provide one via extra_eos_tokens!"
         )
-    pass
 
-    # Check tokenizer types
     tokenizer_name = tokenizer.name_or_path.lower()
     if tokenizer_name.startswith(("unsloth/llama-3-8b-instruct", "unsloth/llama-3-70b-instruct")):
-        # Add <|eot_id|>
         extra_eos_tokens.append("<|eot_id|>")
     elif ("<|eot_id|>" in extra_eos_tokens or "<|eot_id|>" in chat_template) and \
         tokenizer_name.startswith(("unsloth/llama-3-8b", "unsloth/llama-3-70b")):
-        # Warn
         logger.warning(
             "Unsloth: Base llama-3 models did not train <|eot_id|>.\n"\
             "Please use the instruct version or use <|end_of_text|>"
         )
-    pass
-    extra_eos_tokens = list(set(extra_eos_tokens))
+    # dict.fromkeys, not set: extra_eos_tokens.insert(0, tokenizer.eos_token) above sets a priority that
+    # extra_eos_tokens[0] relies on when appending the EOS.
+    extra_eos_tokens = list(dict.fromkeys(extra_eos_tokens))
 
     count_eos = 0
     for eos in extra_eos_tokens:
         count_eos += len(re.findall(r"{OUTPUT}" + re.escape(eos), chat_template))
-    pass
 
-    # This forces you to provide 2 input and outputs
+    # This forces the caller to provide 2 input/output pairs.
     final_combined_check = False
 
     try:
-        # O(N^2) search finding 2 repeatted pieces of text
+        # O(N^2) search for 2 repeated pieces of text.
         j = len(chat_template)-1
         at_least_one = False
         while j > 0:
@@ -1495,7 +3111,6 @@ extra_eos_tokens = None,
             if found == -1: break
             j -= 1
             at_least_one = True
-        pass
         if j > 0: j += 1
         else: raise RuntimeError(error_msg)
 
@@ -1504,21 +3119,18 @@ extra_eos_tokens = None,
         # Must be equivalent to left
         final_combined_check = True
 
-        # Repeatted text
         instruction_response = chat_template[j:]
         if instruction_response.count("{INPUT}") != 1 or instruction_response.count("{OUTPUT}") != 1:
             raise RuntimeError(error_msg)
-        pass
 
-        # 1st System, Instruction, Output pair
         left  = chat_template[:j]
-        # 2nd Instruction, Output pair
         right = chat_template[j:]
 
         final_combined_check = left if final_combined_check else chat_template
 
-        # Isolate input
-        extra_eos_tokens_regex = "|".join(f"(?:{re.escape(x)})" for x in extra_eos_tokens)
+        # Regex alternations prefer the first match, so match prefix tokens last.
+        eos_tokens_for_matching = sorted(extra_eos_tokens, key = len, reverse = True)
+        extra_eos_tokens_regex = "|".join(f"(?:{re.escape(x)})" for x in eos_tokens_for_matching)
         if len(extra_eos_tokens_regex) != 0:
             find_end = f"(?:{extra_eos_tokens_regex})?"
         else:
@@ -1530,14 +3142,11 @@ extra_eos_tokens = None,
         input_end = input_end.span(0)[1]
         input_part = right[:input_end]
 
-        # Isolate output
         output_part = right[input_end:]
 
-        # Isolate system
         where_system = left.find(input_part)
         system_part = left[:where_system if where_system != -1 else len(left)]
 
-        # Check if the user provided a correct prompt
         combined = system_part + input_part + output_part
         if combined != final_combined_check:
             combined_changed = combined            .replace('\n', '\\n')
@@ -1548,20 +3157,55 @@ extra_eos_tokens = None,
                 "But we require the following:\n"\
                 f"{left_changed}"
             )
-        pass
     except:
-        ending = chat_template[chat_template.find("{OUTPUT}") + len("{OUTPUT}"):]
+        # Accidental trailing whitespace (#992) desyncs the two-example detection, so retry once without it.
+        # Templates that parse as-is are never altered.
+        rstripped_chat_template = chat_template.rstrip()
+        if rstripped_chat_template != chat_template:
+            try:
+                return construct_chat_template(
+                    tokenizer = tokenizer,
+                    chat_template = rstripped_chat_template,
+                    default_system_message = default_system_message,
+                    extra_eos_tokens = original_extra_eos_tokens,
+                )
+            except Exception:
+                pass
+
+        output_pos = chat_template.find("{OUTPUT}")
+        input_pos  = chat_template.find("{INPUT}")
+        if output_pos == -1 or input_pos == -1:
+            missing = []
+            if input_pos  == -1: missing.append("{INPUT}")
+            if output_pos == -1: missing.append("{OUTPUT}")
+            raise RuntimeError(
+                f"Unsloth: chat_template must contain {' and '.join(missing)} "
+                f"placeholder(s). Got: {chat_template[:200]!r}"
+            )
+        ending = chat_template[output_pos + len("{OUTPUT}"):]
 
         ending = re.escape(ending)
         find_text = "{INPUT}" + ending + "(.+?{OUTPUT}" + ending + ")"
         response_part = re.findall(find_text, chat_template, flags = re.DOTALL | re.MULTILINE)
+        if len(response_part) == 0:
+            raise RuntimeError(
+                "Unsloth: Could not recover a two-example structure from chat_template. "
+                "Provide exactly two {INPUT}/{OUTPUT} pairs (and optionally {SYSTEM}). "
+                f"Got: {chat_template[:200]!r}"
+            )
         response_part = response_part[0]
 
+        found = None
         for j in range(1, len(response_part)):
             try_find = re.escape(response_part[:j])
-            try: found = next(re.finditer("(" + try_find + ").+?\{INPUT\}", chat_template, flags = re.DOTALL | re.MULTILINE))
+            try: found = next(re.finditer("(" + try_find + ").+?\\{INPUT\\}", chat_template, flags = re.DOTALL | re.MULTILINE))
             except: break
-        pass
+        if found is None:
+            raise RuntimeError(
+                "Unsloth: Could not locate a separator between examples in chat_template. "
+                "Provide exactly two {INPUT}/{OUTPUT} pairs (and optionally {SYSTEM}). "
+                f"Got: {chat_template[:200]!r}"
+            )
         separator = found.group(1)
 
         response_start = chat_template.find(response_part)
@@ -1574,17 +3218,14 @@ extra_eos_tokens = None,
         system_part = chat_template[:where]
 
         system_part, input_part, output_part = system_part, instruction_part, response_part
-    pass
 
     if count_eos == 0:
         logger.warning("Unsloth: We automatically added an EOS token to stop endless generations.")
         eos = extra_eos_tokens[0]
         output_part = output_part + eos
-    pass
 
-    # Ollama modelfile parts
 
-    # Check bos_token is in system prompt
+    # bos_token must be in the system prompt.
     ollama_system = system_part
     has_bos_token = False
     always_bos_token = False
@@ -1593,44 +3234,37 @@ extra_eos_tokens = None,
         if ollama_system.startswith(tokenizer.bos_token):
             has_bos_token = True
             ollama_system = ollama_system[len(tokenizer.bos_token):]
-        pass
-    pass
-    # Check system
     if "{SYSTEM}" in ollama_system:
         system_modelfile = "{{ if .System }}" + ollama_system.replace("{SYSTEM}", "{{ .System }}") + "{{ end }}"
     else:
         system_modelfile = ollama_system
-    pass
     input_modelfile  = "{{ if .Prompt }}" + input_part .replace("{INPUT}",  "{{ .Prompt }}") + "{{ end }}"
     output_modelfile = output_part.replace("{OUTPUT}", "{{ .Response }}")
 
-    # Ollama EOS
     ollama_eos = get_ollama_eos_tokens(tokenizer, extra_eos_tokens)
     ollama_eos = '\n'.join(f'PARAMETER stop "{eos}"' for eos in ollama_eos)
 
-    # Add temperature and min_p to counteract gibberish
+    # Temperature and min_p counteract gibberish.
     ollama_eos += "\nPARAMETER temperature 1.5\nPARAMETER min_p 0.1"
 
-    # Ollama modelfile
     part = '"""'
     modelfile = 'FROM {__FILE_LOCATION__}\n\n'\
     'TEMPLATE ' + part + system_modelfile + input_modelfile + output_modelfile + \
         part + '\n\n' + ollama_eos
 
-    # HF Jinja Chat template
     def process(part, which, content = "message['content']"):
+        # Escape the literal pieces only; the placeholder becomes Jinja syntax below.
+        part = which.join(_escape_jinja_literal(piece) for piece in part.split(which))
         if part.endswith(which):
             part = "'" + part[:part.find(which)] + f"' + {content}"
         elif part.startswith(which):
-            part = f"{content} + '" + part[part.find(which):] + "'"
+            part = f"{content} + '" + part[len(which):] + "'"
         else:
             part = "'" + part.replace(which, f"' + {content} + '") + "'"
         if part.startswith("'' + "): part = part[5:]
         return part
-    pass
     input_jinja  = process(input_part,  "{INPUT}")
     output_jinja = process(output_part, "{OUTPUT}")
-    pass
 
     jinja_template = \
         "{% for message in loop_messages %}"\
@@ -1643,48 +3277,50 @@ extra_eos_tokens = None,
             "{% endif %}"\
         "{% endfor %}"\
         "{% if add_generation_prompt %}"\
-            "{{ '" + output_part[:output_part.find("{OUTPUT}")] + "' }}"\
+            "{{ '" + _escape_jinja_literal(output_part[:output_part.find("{OUTPUT}")]) + "' }}"\
         "{% endif %}"
-    pass
 
-    # Now add system prompt to jinja
     if len(system_part) != 0:
+        # Strip the BOS while raw: an escaped bos_token no longer matches.
+        if has_bos_token:
+            system_part = system_part.replace(tokenizer.bos_token, "", 1)
         partial_system = process(system_part, "{SYSTEM}", "messages[0]['content']")
         partial_system = partial_system.replace("{SYSTEM}", "")
+        system_expr = partial_system
 
         if "{SYSTEM}" in partial_system:
             if default_system_message is None:
                 raise RuntimeError("Unsloth: Please specify a default system message!")
-        pass
 
-        # Separate the BOS
-        if has_bos_token:
-            partial_system = partial_system.replace(tokenizer.bos_token, "", 1)
-            system_part    = system_part   .replace(tokenizer.bos_token, "", 1)
-        pass
-        
         partial_system = \
             "{% if messages[0]['role'] == 'system' %}"\
                 "{{ " + partial_system + " }}"\
                 "{% set loop_messages = messages[1:] %}"
         if default_system_message is not None:
-            full_system = system_part.replace("{SYSTEM}", default_system_message)
+            full_system = _escape_jinja_literal(system_part.replace("{SYSTEM}", default_system_message))
             if "{SYSTEM}" in system_part:
                 modelfile += '\nSYSTEM "' + default_system_message + '"'
-            pass
             partial_system += "{% else %}"\
                 "{{ '" + full_system + "' }}"\
                 "{% set loop_messages = messages %}"\
             "{% endif %}"
+        elif "{SYSTEM}" in system_part:
+            # Only bind loop_messages when the template can render a caller system message; a static prefix with
+            # no {SYSTEM} must still raise, not drop it.
+            partial_system += "{% else %}"\
+                "{% set loop_messages = messages %}"\
+            "{% endif %}"
         else:
-            partial_system += "{% endif %}"
-        pass
+            # Emit a static prefix on both branches so the collapse below makes it unconditional.
+            partial_system += "{% else %}"\
+                "{{ " + system_expr + " }}"\
+                "{% set loop_messages = messages %}"\
+            "{% endif %}"
 
         jinja_template = partial_system + jinja_template
 
         if has_bos_token:
             jinja_template = "{{ bos_token }}" + jinja_template
-    pass
 
     # Fix missing loop_messages
     if "{% set loop_messages = messages %}" not in jinja_template:
@@ -1693,11 +3329,10 @@ extra_eos_tokens = None,
             "{% for message in messages %}",
             1, # Only replace the first one
         )
-    pass
 
     # Check if system part is the same!
     jinja_template = re.sub(
-        r"\{\% if messages\[0\]\['role'\] \=\= 'system' \%\}\{\{ '(.+?)' \}\}"\
+        r"\{\% if messages\[0\]\['role'\] \=\= 'system' \%\}\{\{ '(.*?)' \}\}"\
         r"\{\% set loop\_messages \= messages\[1\:\] \%\}"\
         r"\{\% else \%\}\{\{ '\1' \}\}\{\% set loop\_messages \= messages \%\}\{\% endif \%\}"\
         r"\{\% for message in loop\_messages \%\}",
@@ -1705,17 +3340,27 @@ extra_eos_tokens = None,
         jinja_template, flags = re.MULTILINE | re.DOTALL,
     )
 
-    # Check jinja tempate for bos
+    # Check jinja template for bos
     if always_bos_token:
         if not jinja_template.startswith(("{{ bos_token }}", "{{- bos_token }}")):
             jinja_template = "{{ bos_token }}" + jinja_template
-    pass
 
     # Get instruction and output parts for train_on_inputs = False
-    input_part  = input_part [:input_part .find("{INPUT}")]
-    output_part = output_part[:output_part.find("{OUTPUT}")]
+    input_idx  = input_part .find("{INPUT}")
+    output_idx = output_part.find("{OUTPUT}")
+    if input_idx == -1:
+        raise RuntimeError(
+            f"Unsloth: The instruction section of the template must contain the "
+            f"'{{INPUT}}' placeholder. Section: {input_part[:200]!r}"
+        )
+    if output_idx == -1:
+        raise RuntimeError(
+            f"Unsloth: The response section of the template must contain the "
+            f"'{{OUTPUT}}' placeholder. Section: {output_part[:200]!r}"
+        )
+    input_part  = input_part [:input_idx ]
+    output_part = output_part[:output_idx]
     return modelfile, jinja_template, input_part, output_part
-pass
 
 
 def test_construct_chat_template():
@@ -1734,10 +3379,10 @@ def test_construct_chat_template():
 {INPUT}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 {OUTPUT}<|eot_id|>"""
-    
+
     default_system_message = \
         "Below are some instructions that describe some tasks. Write responses that appropriately complete each request."
-      
+
     extra_eos_tokens = None
 
     modelfile, jinja_template, _, _ = construct_chat_template(
@@ -1759,8 +3404,6 @@ def test_construct_chat_template():
     tokenizer.chat_template = jinja_template
     new_output = tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
     assert(correct_output == new_output)
-    pass
-pass
 
 
 def apply_chat_template( \
@@ -1779,15 +3422,15 @@ chat_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 {INPUT}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 {OUTPUT}<|eot_id|>""",
-    
+
 default_system_message = \
     "Below are some instructions that describe some tasks. Write responses that appropriately complete each request.",
-  
+
 extra_eos_tokens = None,
-  
+
 ):
     """
-    Creates a Ollama modelfile and a HF Jinja template from a custom
+    Creates an Ollama modelfile and a HF Jinja template from a custom
     template. You must provide 2x examples of an input & output.
     There is an optional system message as well.
 
@@ -1803,47 +3446,57 @@ extra_eos_tokens = None,
         convos = examples["conversations"]
         texts = [tokenizer.apply_chat_template(convo, tokenize = False, add_generation_prompt = False) for convo in convos]
         return { "text" : texts, }
-    pass
 
     tokenizer.chat_template = jinja_template
     tokenizer._ollama_modelfile = modelfile
     tokenizer._unsloth_input_part  = input_part
     tokenizer._unsloth_output_part = output_part
+    if hasattr(tokenizer, "tokenizer"):
+        tokenizer.tokenizer.chat_template = jinja_template
+        tokenizer.tokenizer._ollama_modelfile = modelfile
+        tokenizer.tokenizer._unsloth_input_part  = input_part
+        tokenizer.tokenizer._unsloth_output_part = output_part
 
     return dataset.map(formatting_prompts_func, batched = True,)
-pass
 
 
 def create_stopping_criteria(tokenizer, stop_word = "eos_token"):
+    try:
+        import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList
+    except ImportError as exc:
+        raise ImportError(
+            "Unsloth: create_stopping_criteria requires PyTorch and is only "
+            "supported on Torch backends."
+        ) from exc
+
     class StoppingCriteriaSub(StoppingCriteria):
         __slots__ = "stop_token", "single_match", "length",
 
-        def __init__(self, stops = "eos_token", device = "cuda", encounters = 1):
+        def __init__(self, stops = "eos_token", encounters = 1):
             super().__init__()
             if stops == "eos_token":
-                self.stop_token = torch.tensor(tokenizer.eos_token_id, device = "cuda")
+                self.stop_token = torch.tensor(tokenizer.eos_token_id)
                 self.length = 1
             else:
                 self.stop_token = tokenizer(["\n" + stops], add_special_tokens = False, return_tensors = "pt")
-                self.stop_token = self.stop_token.input_ids.ravel()[1:].to("cuda")
+                self.stop_token = self.stop_token.input_ids.ravel()[1:]
                 self.length = self.stop_token.shape[0]
-            pass
             self.single_match = self.length == 1
-        pass
 
-        def __call__(self, input_ids: LongTensor, scores: FloatTensor) -> bool:
-            input_ids = input_ids.ravel()
-            last_token = input_ids[-1]
-            if self.single_match and (last_token == self.stop_token): return True
-
-            if input_ids.shape[0] >= self.length and \
-                (input_ids[-self.length:] == self.stop_token).all(): return True
-            return False
-        pass
-    pass
+        def __call__(self, input_ids: LongTensor, scores: FloatTensor):
+            single_sequence = input_ids.ndim == 1
+            if single_sequence:
+                input_ids = input_ids.unsqueeze(0)
+            if self.stop_token.device != input_ids.device:
+                self.stop_token = self.stop_token.to(input_ids.device)
+            if input_ids.shape[-1] < self.length:
+                matches = torch.zeros(input_ids.shape[0], dtype = torch.bool, device = input_ids.device)
+            else:
+                matches = (input_ids[:, -self.length:] == self.stop_token).all(dim = -1)
+            return matches.item() if single_sequence else matches
     stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops = stop_word)])
     return stopping_criteria
-pass
 
 
 def test_chat_templates():
@@ -1856,7 +3509,6 @@ def test_chat_templates():
         {"role": "user", "content": "  No it's 100% 5! "},
     ]
 
-    # Zephyr
     from transformers import AutoTokenizer
     template = zephyr_template
     correct_tokenizer = AutoTokenizer.from_pretrained("HuggingFaceH4/zephyr-7b-beta")
@@ -1865,7 +3517,6 @@ def test_chat_templates():
     our_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
 
-    # Chatml
     template = chatml_template
     correct_tokenizer = AutoTokenizer.from_pretrained("teknium/OpenHermes-2.5-Mistral-7B")
     correct_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
@@ -1873,7 +3524,6 @@ def test_chat_templates():
     our_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
 
-    # Mistral
     template = mistral_template
     correct_tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
     correct_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
@@ -1881,7 +3531,6 @@ def test_chat_templates():
     our_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
 
-    # Llama
     template = llama_template
     correct_tokenizer = AutoTokenizer.from_pretrained("unsloth/llama-2-7b-chat")
     correct_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
@@ -1889,7 +3538,6 @@ def test_chat_templates():
     our_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
 
-    # Vicuna
     try:
         from fastchat.conversation import get_conv_template
     except:
@@ -1899,10 +3547,10 @@ def test_chat_templates():
     for j in range(len(messages)-1):
         correct_prompt.append_message(correct_prompt.roles[j%2==1], messages[j+1]["content"])
     correct_prompt.append_message(correct_prompt.roles[1], "")
-    correct_prompt = tokenizer.bos_token + correct_prompt.get_prompt()
 
     template = vicuna_template
     correct_tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-7b-v1.5")
+    correct_prompt = correct_tokenizer.bos_token + correct_prompt.get_prompt()
     correct_tokenizer.chat_template = template
     our_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
@@ -1916,23 +3564,21 @@ def test_chat_templates():
     for j in range(len(messages)-1):
         correct_prompt.append_message(correct_prompt.roles[j%2==1], messages[j+1]["content"])
     correct_prompt.append_message(correct_prompt.roles[1], "")
-    correct_prompt = tokenizer.bos_token + correct_prompt.get_prompt()
 
     template = vicuna_old_template
     correct_tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-7b-v1.5")
+    correct_prompt = correct_tokenizer.bos_token + correct_prompt.get_prompt()
     correct_tokenizer.chat_template = template
     our_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
-    # We add </s> ourselves
+    # </s> is added here rather than by the template.
     assert(correct_prompt == our_prompt.replace("</s>", ""))
 
-    # Gemma
     correct_tokenizer = AutoTokenizer.from_pretrained("unsloth/gemma-7b-it")
     correct_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
     correct_tokenizer.chat_template = gemma_template
     our_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
     assert(our_prompt == correct_prompt)
 
-    # Llama-3
     template = llama3_template
     correct_tokenizer = AutoTokenizer.from_pretrained("unsloth/llama-3-8b-Instruct")
     correct_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
@@ -1940,14 +3586,12 @@ def test_chat_templates():
     our_prompt = correct_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
 
-    # Phi-3
     template = phi3_template
     correct_tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
     correct_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
     correct_tokenizer.chat_template = template
     our_prompt = correct_tokenizer.apply_chat_template(messages[1:], tokenize = False, add_generation_prompt = True)
     assert(correct_prompt == our_prompt)
-pass
 
 
 def test_hf_gguf_equivalence(tokenizer, gguf_model = "./model-unsloth.F16.gguf"):
@@ -1975,32 +3619,37 @@ def test_hf_gguf_equivalence(tokenizer, gguf_model = "./model-unsloth.F16.gguf")
 
     ### Response:
     {}""".format(
-        "Describe the city given eloquently.", # instruction
-        "The lost city of Atlantis.", # input
+        "Describe the city given eloquently.",
+        "The lost city of Atlantis.",
         "", # output - leave this blank for generation!
     )
     prompts = [ prompt, ]
 
     if tokenizer.chat_template is not None:
         prompt = tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
-        prompt = prompt.replace("'", "") # Subprocess does not like ''
         prompt = remove_special_tokens(tokenizer, prompt)
         prompts.append(prompt)
-    pass
-    
+
     for prompt in prompts:
-        command = f"./llama.cpp/llama-cli -m {gguf_model} -n 0 --temp 0.0 --verbose-prompt "\
-            f"--check-tensors -p '{prompt}'"
+        # A list of args with shell=False so prompt content is passed literally.
+        command = [
+            "./llama.cpp/llama-cli",
+            "-m", gguf_model,
+            "-n", "0",
+            "--temp", "0.0",
+            "--verbose-prompt",
+            "--check-tensors",
+            "-p", prompt,
+        ]
 
         datas = []
-        with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, bufsize = 1) as sp:
+        with subprocess.Popen(command, shell = False, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, bufsize = 1) as sp:
             for line in sp.stdout:
                 datas.append(line.decode("utf-8", errors = "replace"))
-        pass
         gguf_tokens = "".join(datas)
 
         # Now extract GGUF tokenization attempt
-        gguf_tokenized = re.findall("([\d]{1,}) \-\> \'([^\']{1,})\'", gguf_tokens, flags = re.MULTILINE)
+        gguf_tokenized = re.findall(r"([\d]{1,}) \-\> \'([^\']{1,})\'", gguf_tokens, flags = re.MULTILINE)
         gguf_tokenized = [(int(x[0]), x[1],) for x in gguf_tokenized]
         input_ids = tokenizer(prompt).input_ids
 
@@ -2018,7 +3667,4 @@ def test_hf_gguf_equivalence(tokenizer, gguf_model = "./model-unsloth.F16.gguf")
                 print(gguf_tokenized)
                 print()
                 raise RuntimeError("Failed comparing GGUF to HF.")
-            pass
-        pass
     return True
-pass
