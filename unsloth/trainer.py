@@ -484,6 +484,81 @@ def _is_vision_eval_dataset(dataset, *, unknown_is_vision = False) -> bool:
     return _is_vision_dataset(dataset, unknown_is_vision = unknown_is_vision)
 
 
+def _route_vision_assistant_only_loss(
+    args,
+    data_collator,
+    model,
+    processing_class,
+    train_dataset,
+    eval_dataset = None,
+):
+    """SFT `assistant_only_loss = True` on a vision run masks with Unsloth's train_on_responses_only.
+
+    TRL refuses vision assistant-only loss below transformers 5.18 and above it relies on processor
+    assistant masks; UnslothVisionDataCollator never read the flag. Called before TRL's __init__:
+    returns the collator to use and turns the flag off so TRL neither refuses nor masks again.
+    When the chat template's markers cannot be detected, nothing changes and TRL behaves as before.
+    Text runs are left to unsloth_zoo's dataset preparation."""
+    requested = getattr(args, "assistant_only_loss", False) or getattr(
+        args, "_unsloth_assistant_only_loss", False
+    )
+    if not requested:
+        return data_collator
+    user_collator = data_collator
+    if not isinstance(user_collator, _UnslothVisionDataCollatorBase):
+        is_vision = (
+            user_collator is None
+            and hasattr(processing_class, "image_processor")
+            and not isinstance(model, str)
+            and (_is_vision_dataset(train_dataset) or _is_vision_eval_dataset(eval_dataset))
+        )
+        if not is_vision:
+            # Text run (or a foreign collator): keep the flag for unsloth_zoo / TRL, even when an
+            # earlier vision trainer built on these args turned it off.
+            args.assistant_only_loss = True
+            return user_collator
+    # A collator that already masks (user built, or routed by an earlier trainer) is not masked twice.
+    if not getattr(user_collator, "train_on_responses_only", None):
+        from unsloth_zoo.dataset_utils import get_chat_template_parts, train_on_responses_only
+
+        processor = getattr(user_collator, "processor", None) or processing_class
+        inner = getattr(processor, "tokenizer", processor)
+        preset = hasattr(inner, "_unsloth_input_part") and hasattr(inner, "_unsloth_output_part")
+        try:
+            if preset:
+                parts = (inner._unsloth_input_part, inner._unsloth_output_part)
+            else:
+                parts = get_chat_template_parts(processor)
+            masker = train_on_responses_only(
+                None,
+                tokenizer = processor,
+                return_function = True,
+                **({} if preset else dict(instruction_part = parts[0], response_part = parts[1])),
+            )
+        except Exception as e:
+            # Same cases TRL cannot mask either (no template, no user / assistant exchange,
+            # unstable marker tokens): change nothing and let TRL behave as it always has.
+            args.assistant_only_loss = True
+            print(
+                "Unsloth: assistant_only_loss = True could not auto-detect the chat template's "
+                f"user / assistant markers ({e}), so it is left to TRL. To mask with Unsloth, pass "
+                "UnslothVisionDataCollator(model, tokenizer, train_on_responses_only = True, "
+                "instruction_part = ..., response_part = ...) as data_collator."
+            )
+            return user_collator
+        data_collator = user_collator
+        if data_collator is None:
+            data_collator = UnslothVisionDataCollator(model, processing_class)
+        data_collator.train_on_responses_only = masker
+        print(
+            "Unsloth: assistant_only_loss = True -> using Unsloth's train_on_responses_only "
+            f"(instruction_part = {parts[0]!r}, response_part = {parts[1]!r})"
+        )
+    args._unsloth_assistant_only_loss = True
+    args.assistant_only_loss = False
+    return data_collator
+
+
 _MULTIMODAL_DATASET_KEYS = _VISION_DATASET_KEYS | frozenset(
     {
         "audio",
@@ -584,6 +659,73 @@ def _uses_multimodal_rope(model_config) -> bool:
         elif isinstance(node, (list, tuple)):
             stack.extend(x for x in node if isinstance(x, (dict, list, tuple)))
     return False
+
+
+_KNOWN_MODEL_PACKAGES = ("transformers", "unsloth", "unsloth_zoo", "peft")
+
+
+def _packed_rows_verdict(model, model_config):
+    """Numeric check that packed rows keep documents apart, for mRoPE models (Qwen2-VL / 2.5-VL build no
+    packed mask from 2D position_ids) and remote-code / unknown classes. None (not probed), "as_is",
+    "text_prepended" (needs [4, B, T] position_ids, text plane first) or "mixes"."""
+    import torch
+
+    if model is None or isinstance(model, str) or not isinstance(model, torch.nn.Module):
+        return None
+    target = model.get_base_model() if callable(getattr(model, "get_base_model", None)) else model
+    mrope = _uses_multimodal_rope(model_config)
+    unknown = type(target).__module__.split(".")[0] not in _KNOWN_MODEL_PACKAGES
+    if not (mrope or unknown):
+        return None
+    # Verified per-document families; a backbone probe would also skip the hybrid varlen wrapper.
+    model_type = str(getattr(model_config, "model_type", "") or "").removesuffix("_text")
+    if not unknown and model_type in _PROCESSOR_TEXT_PACKING_MROPE_MODELS:
+        return None
+    cached = getattr(target, "_unsloth_packed_rows_verdict", None)
+    if cached is not None:
+        return cached
+    config = getattr(target, "config", None)
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    vocab = getattr(text_config, "vocab_size", None)
+    if next(target.parameters(), None) is None or not isinstance(vocab, int) or vocab < 20:
+        return None
+    from .models.rl import _packing_honored, _text_prepended_position_ids
+
+    # Remote code probed whole (its head may drop position_ids); others at the backbone (compiled heads may return no logits).
+    probe = target
+    if not unknown:
+        probe = getattr(target, "model", None)
+        if not isinstance(probe, torch.nn.Module):
+            probe = getattr(target, "base_model", target)
+    verdict = "mixes"
+    if _packing_honored(probe, None, packed_lengths = True):
+        verdict = "as_is"
+    elif mrope and _packing_honored(probe, _text_prepended_position_ids, packed_lengths = True):
+        verdict = "text_prepended"
+    try:
+        target._unsloth_packed_rows_verdict = verdict
+    except Exception:
+        pass
+    return verdict
+
+
+def _install_text_prepended_position_ids(model):
+    """Packed batches (they carry packed_seq_lengths) reach the model with [4, B, T] position_ids."""
+    if getattr(model, "_unsloth_text_prepended_position_ids", False):
+        return
+    from .models.rl import _text_prepended_position_ids
+
+    def pre_hook(module, args, kwargs):
+        position_ids = kwargs.get("position_ids")
+        if kwargs.get("packed_seq_lengths") is None or position_ids is None:
+            return None
+        if position_ids.dim() != 2:
+            return None
+        kwargs["position_ids"] = _text_prepended_position_ids(position_ids)
+        return args, kwargs
+
+    model.register_forward_pre_hook(pre_hook, with_kwargs = True)
+    model._unsloth_text_prepended_position_ids = True
 
 
 # mRoPE families whose text model expands 2D position_ids into the text row (transformers 5.2+),
@@ -2057,6 +2199,25 @@ def _patch_sft_trainer_auto_packing(trl_module):
         )
         requested_pack = bool(getattr(config_arg, "packing", False))
         requested_padding_free = getattr(config_arg, "padding_free", None) is True
+        packed_rows = None
+        if (
+            boundary_blocker is None
+            and not blocked
+            and (
+                _should_pack(config_arg)
+                or requested_padding_free
+                or _should_auto_padding_free(config_arg)
+            )
+        ):
+            try:
+                packed_rows = _packed_rows_verdict(model, model_config)
+            except Exception as error:
+                packed_rows = "mixes"
+                logger.info(f"Unsloth: packed-row check failed ({type(error).__name__}: {error}).")
+            if packed_rows == "mixes":
+                boundary_blocker = (
+                    f"{model_types[0] if model_types else type(model).__name__} (packed rows)"
+                )
         if boundary_blocker is not None:
             if (
                 not blocked
@@ -2271,6 +2432,12 @@ def _patch_sft_trainer_auto_packing(trl_module):
             else:
                 _unpacked_for_evaluation(self, collator)
 
+        if (
+            packed_rows == "text_prepended"
+            and not blocked
+            and (trainer_packing or trainer_padding_free)
+        ):
+            _install_text_prepended_position_ids(self.model)
         if not blocked and trainer_packing and (packing_active or _should_pack(trainer_args)):
             enable_sample_packing(self.model, self)
             if default_packing:

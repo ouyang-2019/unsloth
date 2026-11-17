@@ -59,6 +59,17 @@ def load_identity(repo_id, base_repo, family) -> LoadIdentity:
     return LoadIdentity(str(repo_id or ""), str(base_repo or ""), str(family or ""))
 
 
+def load_lora_signature(specs) -> tuple:
+    """Comparable form of a load's ``load_lora_specs``: a same-model reload with other adapters differs."""
+    out = []
+    for spec in specs or ():
+        try:
+            out.append((str(spec["id"]), float(spec["weight"])))
+        except Exception:  # noqa: BLE001 - a malformed row names no adapter
+            continue
+    return tuple(out)
+
+
 # The image queue pins the checkpoint file too: another quant of the same repo is the same LoadIdentity.
 _pinned_checkpoint: contextvars.ContextVar = contextvars.ContextVar(
     "pinned_checkpoint", default = None
@@ -739,6 +750,12 @@ _FAMILIES: tuple[DiffusionFamily, ...] = (
         sd_cpp_sampling_method = "euler",
         sd_cpp_arch_marker = _FLUX3_SD_CPP_ARCH_MARKER,
         sd_cpp_reference = True,
+        # Trains the undistilled base; the distilled Klein is the same DiT, so Deploy loads the adapter there.
+        trainable = True,
+        train_base_repos = ("black-forest-labs/flux-3-image-klein-base",),
+        deploy_base_repos = (
+            ("black-forest-labs/flux-3-image-klein-base", "black-forest-labs/flux-3-image-klein"),
+        ),
     ),
     DiffusionFamily(
         name = "flux.3-klein",

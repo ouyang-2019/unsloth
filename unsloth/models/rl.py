@@ -3247,6 +3247,15 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
     if "data_collator" in call_args and "train_dataset" in call_args:
         data_collator_check = (
             "__tokenizer = processing_class if 'processing_class' in locals() else tokenizer\n"
+        )
+        if trainer_file == "sft_trainer":
+            # assistant_only_loss on a vision run -> Unsloth's train_on_responses_only, on every transformers version.
+            data_collator_check += (
+                "from unsloth.trainer import _route_vision_assistant_only_loss\n"
+                "data_collator = _route_vision_assistant_only_loss(args, data_collator, model, __tokenizer, train_dataset, "
+                "eval_dataset if 'eval_dataset' in locals() else None)\n"
+            )
+        data_collator_check += (
             "from unsloth_zoo.vision_utils import UnslothVisionDataCollator\n"
             "if not isinstance(data_collator, UnslothVisionDataCollator):\n"
             "    if isinstance(data_collator, DataCollatorForSeq2Seq) and 'labels' not in _unsloth_dataset_column_names(train_dataset):\n"
@@ -3301,6 +3310,8 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
     if "model" in call_args:
         accelerator_check = (
             "if hasattr(self, 'accelerator'):\n"
+            "    from unsloth.models._utils import _unsloth_forced_float32_grad_scaler\n"
+            "    _unsloth_forced_float32_grad_scaler(self, model)\n"
             "    scaler = self.accelerator.scaler\n"
             "    current_model = model\n"
             "    while hasattr(current_model, 'model'):\n"
@@ -4619,8 +4630,13 @@ def patch_trl_rl_trainers():
     import trl.trainer
 
     all_trainers = dir(trl.trainer)
+    # async_grpo_trainer (TRL >= 1.18) is patched in place by patch_trl_async_grpo, which needs TRL's own globals.
     all_trainers = [
-        x for x in all_trainers if x.islower() and x.endswith("_trainer") and x != "base_trainer"
+        x
+        for x in all_trainers
+        if x.islower()
+        and x.endswith("_trainer")
+        and x not in ("base_trainer", "async_grpo_trainer")
     ]
     # Imported before the walk rebinds trl.trainer.sft_trainer.SFTTrainer, so GKDTrainer(SFTTrainer) keeps TRL's own base whatever the user's import order.
     experimental = _import_trl_experimental_trainers()
@@ -5039,9 +5055,14 @@ def _text_prepended_position_ids(position_ids):
 
 
 @torch.no_grad()
-def _packing_honored(backbone, position_transform = None):
+def _packing_honored(
+    backbone,
+    position_transform = None,
+    packed_lengths = False,
+):
     # Runs the backbone the way the fused head does: a second packed sequence must match itself run alone far more
     # closely than when it can see the first one. Numeric, so it covers every attention and mixer implementation.
+    # packed_lengths: also pass packed_seq_lengths, as the SFT padding-free collator does.
     params = next(backbone.parameters(), None)
     if params is None:
         return False
@@ -5061,39 +5082,108 @@ def _packing_honored(backbone, position_transform = None):
     training = [(module, module.training) for module in backbone.modules()]
     # Train mode as in the trainer (gpt-oss differs), dropout off for a deterministic compare.
     backbone.train()
+    rates = []
     for module in backbone.modules():
         if isinstance(module, torch.nn.modules.dropout._DropoutNd):
             module.training = False
+        # Functional attention dropout (`dropout_p = self.attention_dropout if self.training`).
+        for attr in ("attention_dropout", "dropout"):
+            value = getattr(module, attr, None)
+            if type(value) is float and value > 0:
+                rates.append((module, attr, value))
+                setattr(module, attr, 0.0)
 
-    def hidden(input_ids, position_ids):
+    def hidden(input_ids, position_ids, lengths):
+        extra = {}
+        if packed_lengths:
+            extra["packed_seq_lengths"] = torch.tensor(lengths, dtype = torch.int32, device = device)
         with torch.autocast(device.type, dtype = dtype, enabled = device.type in ("cuda", "xpu")):
             out = backbone(
-                input_ids = input_ids, position_ids = transform(position_ids), use_cache = False
+                input_ids = input_ids,
+                position_ids = transform(position_ids),
+                use_cache = False,
+                **extra,
             )
-        return out.last_hidden_state.float()
+        # A backbone output, a causal LM output (remote code probed whole) or a bare tensor.
+        for name in ("last_hidden_state", "logits"):
+            value = getattr(out, name, None)
+            if isinstance(value, torch.Tensor):
+                return value.float()
+        return (out[0] if isinstance(out, (tuple, list)) else out).float()
 
     try:
         arange = lambda n: torch.arange(n, device = device)[None]
-        packed = hidden(ids, torch.cat([arange(first), arange(second)], dim = 1))[0, first:]
-        alone = hidden(ids[:, first:], arange(second))[0]
-        crossed = hidden(ids, arange(first + second))[0, first:]
+        packed = hidden(ids, torch.cat([arange(first), arange(second)], dim = 1), [first, second])
+        packed = packed[0, first:]
+        alone = hidden(ids[:, first:], arange(second), [second])[0]
+        crossed = hidden(ids, arange(first + second), [first + second])[0, first:]
     finally:
         for module, mode in training:
             module.training = mode
+        for module, attr, value in rates:
+            setattr(module, attr, value)
     leak = (packed - alone).abs().mean()
     control = (crossed - alone).abs().mean()
     return bool(torch.isfinite(leak)) and bool(control > 0) and bool(leak <= 0.2 * control)
 
 
-def _unsloth_async_grpo_lm_head(original, flag):
+def _forward_tree_unrolled(head_forward, f_args, f_kwargs):
+    # TRL >= 1.17 prefix-trie rows need tree attention, which Unsloth lacks: unroll each root-to-leaf path into its
+    # own packed sequence and read each trie position back from one copy (exact; shared prefixes forwarded per sample).
+    tree = {key: f_kwargs.pop(key) for key in list(f_kwargs) if key.startswith("tree_")}
+    position_ids = f_kwargs.get("position_ids")
+    parents = tree["tree_segment_parents"]
+    cu_seqlens_k = tree["tree_cu_seqlens_k"].long()
+    path_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    if bool((parents < 0).all()):
+        f_kwargs["packed_seq_lengths"] = path_lengths.to(torch.int32)
+        return head_forward(*f_args, **f_kwargs)
+    length = position_ids.shape[1]
+    device = position_ids.device
+    leaf = torch.ones(parents.numel(), dtype = torch.bool, device = parents.device)
+    leaf[parents[parents >= 0].long()] = False
+    kv_index = tree["tree_kv_index"].to(device)
+    segment_of = torch.repeat_interleave(
+        torch.arange(parents.numel(), device = device), path_lengths.to(device)
+    )
+    index = kv_index[leaf.to(device)[segment_of]]
+    # Every trie node lies on a sample's path and every sample ends on a leaf, so each position gets a copy.
+    source = torch.empty(length, dtype = torch.long, device = device)
+    source[index] = torch.arange(index.numel(), device = device)
+    chosen = torch.zeros(index.numel(), dtype = torch.bool, device = device)
+    chosen[source] = True
+
+    for key, value in list(f_kwargs.items()):
+        if torch.is_tensor(value) and value.dim() >= 2 and value.shape[:2] == (1, length):
+            value = value.index_select(1, index.to(value.device))
+            if key in ("shift_labels", "labels"):
+                value = value.masked_fill(~chosen.to(value.device)[None], -100)
+            f_kwargs[key] = value
+    f_kwargs["packed_seq_lengths"] = path_lengths[leaf.to(path_lengths.device)].to(torch.int32)
+    outputs = head_forward(*f_args, **f_kwargs)
+    for key, value in list(outputs.items()) if hasattr(outputs, "items") else ():
+        if torch.is_tensor(value) and value.dim() >= 2 and value.shape[:2] == (1, index.numel()):
+            outputs[key] = value.index_select(1, source.to(value.device))
+    return outputs
+
+
+def _unsloth_async_grpo_lm_head(
+    original,
+    flag,
+    tree_attention = None,
+):
     # TRL >= 1.15 `add_fused_lm_head` (active when `flag` is passed), TRL 1.13-1.14 `patch_chunked_lm_head` (always).
+    # tree_attention: the attention TRL >= 1.17 sets on the model for prefix-trie rows.
     def patch_lm_head(model, *args, **kwargs):
         # The head replaces the CausalLM forward and calls its backbone, so it must sit under any PEFT wrapper.
         target = model.get_base_model() if hasattr(model, "get_base_model") else model
         original(target, *args, **kwargs)
         head_forward = target.forward
+        unroll_tree = False
         if _is_unsloth_fast_backbone(getattr(target, "base_model", None)):
-            # Unsloth's attention reads sequence boundaries from packed_seq_lengths, not position_ids resets.
+            # Unsloth attention ignores TRL's tree attention and position_ids resets, so unroll prefix-trie rows.
+            unroll_tree = True
+
             def packed_kwargs(f_kwargs):
                 if f_kwargs.get("packed_seq_lengths") is None:
                     lengths = _packed_seq_lengths_from_position_ids(f_kwargs.get("position_ids"))
@@ -5112,6 +5202,9 @@ def _unsloth_async_grpo_lm_head(original, flag):
             )
             transforms = [None, _text_prepended_position_ids] if is_vlm else [None]
             attn = str(getattr(config, "_attn_implementation", None) or "")
+            if tree_attention is not None and attn == tree_attention:
+                # TRL's own tree attention routes every segment along its path; it runs only on its GPU kernel.
+                return
             if "flash" in attn and not is_vlm:
                 # Varlen flash attention reads sequence boundaries from position_ids, as TRL expects; TRL builds
                 # these models on CPU, where the kernel cannot run the self-test.
@@ -5146,6 +5239,8 @@ def _unsloth_async_grpo_lm_head(original, flag):
         @functools.wraps(head_forward)
         def forward(*f_args, **f_kwargs):
             if flag is None or f_kwargs.get(flag):
+                if unroll_tree and "tree_kv_index" in f_kwargs:
+                    return _forward_tree_unrolled(head_forward, f_args, f_kwargs)
                 packed_kwargs(f_kwargs)
             return head_forward(*f_args, **f_kwargs)
 
@@ -5371,18 +5466,33 @@ def _async_grpo_masked_compute_loss(compute_loss):
     return functools.wraps(compute_loss)(namespace[compute_loss.__name__])
 
 
+def _import_trl_async_grpo_module():
+    # TRL >= 1.18: stable module (experimental is a subclassing shim, so both are covered); 1.13-1.17: experimental.
+    errors = []
+    for package, name in (
+        ("trl.trainer", "trl.trainer.async_grpo_trainer"),
+        ("trl.experimental.async_grpo", "trl.experimental.async_grpo.async_grpo_trainer"),
+    ):
+        try:
+            if importlib.util.find_spec(package) is None or importlib.util.find_spec(name) is None:
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                module = importlib.import_module(name)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            continue
+        if hasattr(module, "AsyncGRPOTrainer"):
+            return module
+    if errors:
+        logger.info(f"Unsloth: Could not import TRL's async GRPO trainer: {'; '.join(errors)}")
+    return None
+
+
 def patch_trl_async_grpo():
     # Let TRL's AsyncGRPOTrainer take a loaded Unsloth model; keep packed rows from attending across sequences.
-    if importlib.util.find_spec("trl.experimental") is None:
-        return
-    try:
-        if importlib.util.find_spec("trl.experimental.async_grpo") is None:
-            return
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            import trl.experimental.async_grpo.async_grpo_trainer as async_module
-    except Exception as e:
-        logger.info(f"Unsloth: Could not import trl.experimental.async_grpo: {e}")
+    async_module = _import_trl_async_grpo_module()
+    if async_module is None:
         return
     heads = [
         (name, flag)
@@ -5405,8 +5515,13 @@ def patch_trl_async_grpo():
         return original_create(model_id, *args, **kwargs)
 
     async_module.create_model_from_path = create_model_from_path
+    tree_attention = getattr(async_module, "TREE_ATTENTION", None)
     for name, flag in heads:
-        setattr(async_module, name, _unsloth_async_grpo_lm_head(getattr(async_module, name), flag))
+        setattr(
+            async_module,
+            name,
+            _unsloth_async_grpo_lm_head(getattr(async_module, name), flag, tree_attention),
+        )
 
     trainer_class = async_module.AsyncGRPOTrainer
     original_init = trainer_class.__init__
@@ -5562,6 +5677,6 @@ def PatchFastRL(algorithm = None, FastLanguageModel = None):
     try:
         patch_trl_async_grpo()
     except Exception as e:
-        logger.info(f"Unsloth: Could not patch trl.experimental.async_grpo: {e}")
+        logger.info(f"Unsloth: Could not patch TRL's AsyncGRPOTrainer: {e}")
     if type(algorithm) is str and algorithm.islower():
         PatchRLStatistics(algorithm)
