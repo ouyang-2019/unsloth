@@ -1484,6 +1484,9 @@ def sft_trainer_compute_loss(function_name, function):
         return_outputs = False,
         num_items_in_batch = None,
     ):
+        # TRL >= 1.18 requests router logits per forward, not via config; do the same so aux_loss is kept.
+        if getattr(self, "aux_loss_enabled", False):
+            inputs = {**inputs, "output_router_logits": True}
         # Runs DFT on the TRL fused LM head (TRL >= 1.15 computes it only in compute_loss; older TRL
         # routes it via compute_loss_func); label smoothing must not opt dft out.
         if getattr(self.args, "loss_type", None) == "dft" and self.compute_loss_func is None:
@@ -1746,6 +1749,28 @@ def _unsloth_grpo_autocast_forced_float32(self):
     if forced is None:
         forced = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1"
     return forced
+
+
+def _unsloth_seq_packing_verify_verdict(model, kind, diff, result, ref, cmask):
+    """Failed packing self-verify -> "kill", "cap" or "skip". bf16 has 1-6 nat single-token outliers, so one narrow
+    mismatch on already verified packing only skips; broad (contamination) or repeated mismatches keep the old rule.
+    Narrow = at most 2 bad tokens and at most 1% of the scored completion tokens: one bad token of two one-token
+    rollouts is the whole batch's signal (cross-rollout contamination), not an isolated outlier."""
+    strikes_attr = f"_unsloth_seq_packing_{kind}_strikes"
+    strikes = int(getattr(model, strikes_attr, 0) or 0)
+    verified_T_attr = f"_unsloth_seq_packing_{kind}_verified_T"
+    verified = int(getattr(model, verified_T_attr, 0) or 0) > 0
+    if verified and strikes < 1:
+        live = cmask > 0
+        bad = int((((result.detach().float() - ref.float()).abs() >= 7e-1) & live).sum())
+        if bad <= 2 and bad * 100 <= int(live.sum()):
+            setattr(model, strikes_attr, strikes + 1)
+            # Even a smaller batch must verify again before its packed scores can be trusted.
+            setattr(model, verified_T_attr, 0)
+            setattr(model, f"_unsloth_seq_packing_{kind}_verified_seg", 0)
+            return "skip"
+    setattr(model, strikes_attr, strikes + 1)
+    return "kill" if diff >= 1.5 else "cap"
 
 
 def _unsloth_grpo_refuse_boundary_blind_packing(self, model):
@@ -3058,7 +3083,9 @@ def grpo_trainer__generate_and_score_completions(function_name, function):
             + f"{_indent}_unsloth_rollout_old = _unsloth_grpo_rollout_logps_as_old(\n"
             + f"{_indent}    self, _unsloth_rollout_logps, completion_mask, locals().get('tool_mask'),\n"
             + f"{_indent})\n"
-            + f"{_indent}if _unsloth_rollout_old:\n"
+            # Aligned generation under vLLM IS: pi_old is the policy the loss scores, so skip that forward.
+            + f"{_indent}_unsloth_old_from_new = (not _unsloth_rollout_old) and _unsloth_grpo_old_logps_from_new(self)\n"
+            + f"{_indent}if _unsloth_rollout_old or _unsloth_old_from_new:\n"
             + f"{_indent}    old_per_token_logps = None\n"
             + f"{_indent}el"
             + function[_old_logps_if.start() + 1 + len(_indent) :]
@@ -3070,7 +3097,11 @@ def grpo_trainer__generate_and_score_completions(function_name, function):
             "                completion_ids.size(0), dtype = torch.bool, device = completion_ids.device\n"
             "            )\n"
             # Older TRL (0.23.x) keeps the rollout logprobs only with the IS correction on.
-            '            output["sampling_per_token_logps"] = _unsloth_rollout_logps\n',
+            '            output["sampling_per_token_logps"] = _unsloth_rollout_logps\n'
+            "        if _unsloth_old_from_new:\n"
+            '            output["unsloth_old_logps_from_new"] = torch.ones(\n'
+            "                completion_ids.size(0), dtype = torch.bool, device = completion_ids.device\n"
+            "            )\n",
         )
     elif os.environ.get("UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD", "0") == "1":
         _warn_once(
@@ -4392,6 +4423,7 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                             # Kernel-noise floor is ~0.25; cross-sample contamination is >= 2.4.
                             if _pk_diff < 7e-1:
                                 unwrapped_model._unsloth_seq_packing_nograd_ok = True
+                                unwrapped_model._unsloth_seq_packing_nograd_strikes = 0
                                 # Widen the trusted shape only when at least 2 completion rows exercised cross-sample packing; a single row proves nothing.
                                 if _pk_active >= 2:
                                     unwrapped_model._unsloth_seq_packing_nograd_verified_T = max(
@@ -4404,7 +4436,13 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                                 _pk_use = True
                             else:
                                 _pk_use = False
-                                if _pk_diff >= 1.5:
+                                # A verified layout survives one narrow bf16 outlier (this batch falls back); broad or repeated mismatches keep the old rule.
+                                _pk_vd = _unsloth_seq_packing_verify_verdict(
+                                    unwrapped_model, "nograd", _pk_diff, _pk_result, _pk_ref, _pk_cm
+                                )
+                                if _pk_vd == "skip":
+                                    pass
+                                elif _pk_vd == "kill":
                                     # Contamination (attention ignores the packed mask): disable packing.
                                     unwrapped_model._unsloth_seq_packing_nograd_ok = False
                                 else:
@@ -4908,6 +4946,36 @@ def _patch_grpo_accumulated_loss_prefix_grouper_kill(source):
     )
 
 
+_GRPO_SEQ_PACKING_GRAD_KILL = re.compile(r"(\n[ \t]*)if\s+_pack_diff\s*>=\s*1\.5\s*:")
+_GRPO_SEQ_PACKING_GRAD_PASS = re.compile(
+    r"(\n([ \t]*)unwrapped_model\._unsloth_seq_packing_grad_ok\s*=\s*True[ \t]*)(?=\n)"
+)
+
+
+def _patch_grpo_accumulated_loss_seq_packing_kill(source):
+    """Zoo grad self-verify: route failures through _unsloth_seq_packing_verify_verdict."""
+    if (
+        "_unsloth_seq_packing_grad_ok" not in source
+        or "_unsloth_seq_packing_verify_verdict" in source
+    ):
+        return source
+    if not _GRPO_SEQ_PACKING_GRAD_KILL.search(source) or not _GRPO_SEQ_PACKING_GRAD_PASS.search(
+        source
+    ):
+        return source
+    source = _GRPO_SEQ_PACKING_GRAD_PASS.sub(
+        r"\1\n\2unwrapped_model._unsloth_seq_packing_grad_strikes = 0", source, count = 1
+    )
+    return _GRPO_SEQ_PACKING_GRAD_KILL.sub(
+        r'\1_pack_vd = _unsloth_seq_packing_verify_verdict(unwrapped_model, "grad", _pack_diff, '
+        r"_pack_result, _pack_ref, _pack_cm)"
+        r'\1if _pack_vd == "skip":\1    pass'
+        r'\1elif _pack_vd == "kill":',
+        source,
+        count = 1,
+    )
+
+
 def _patch_grpo_accumulated_loss_prefix_grouper_vllm_gate(source):
     """Drop zoo's vLLM skip for gradient PrefixGrouper unless UNSLOTH_GRPO_PREFIX_GROUPER_VLLM=0."""
     if "prefix_seg_info" not in source:
@@ -5049,6 +5117,44 @@ def _unsloth_grpo_rollout_logps_as_old(
     return True
 
 
+def _unsloth_grpo_old_logps_from_new(trainer):
+    """Skip TRL's old-policy forward under vLLM IS when generation is aligned to the optimizer step:
+    pi_old is then the policy the loss scores (TRL uses per_token_logps.detach() too). Not with a
+    stochastic forward (dropout), where two passes score different policies."""
+    import os
+
+    if os.environ.get("UNSLOTH_GRPO_OLD_LOGPS_FROM_POLICY", "1") == "0":
+        return False
+    if not (
+        getattr(trainer, "use_vllm", False)
+        and getattr(trainer, "vllm_importance_sampling_correction", False)
+    ):
+        return False
+    try:
+        generate_every = int(trainer.args.steps_per_generation) * int(trainer.num_iterations)
+        if (
+            generate_every <= 0
+            or int(trainer.args.gradient_accumulation_steps) % generate_every != 0
+        ):
+            return False
+    except Exception:
+        return False
+    supported = getattr(trainer, "_unsloth_old_logps_from_new_ok", None)
+    if supported is None:
+        try:
+            from unsloth_zoo.rl_replacements import grpo_old_logps_from_new  # noqa: F401
+            from unsloth_zoo.rl_replacements import grpo_policy_is_stochastic
+            supported = not grpo_policy_is_stochastic(getattr(trainer, "model", None))
+        except Exception:
+            supported = False
+        trainer._unsloth_old_logps_from_new_ok = supported
+    if supported:
+        trainer._unsloth_old_logps_from_new_batches = (
+            getattr(trainer, "_unsloth_old_logps_from_new_batches", 0) + 1
+        )
+    return supported
+
+
 def _unsloth_grpo_sample_weight_mode():
     import os
 
@@ -5145,7 +5251,10 @@ def _unsloth_grpo_is_metric_values(delta, flat_is_ratio, mask, sequence_level):
     if mask is None or delta.shape != mask.shape or flat_is_ratio.shape != mask.shape:
         return delta.reshape(-1), flat_is_ratio.reshape(-1)
     keep = mask.to(torch.bool)
+    # nan = token not scored (skipped zero-advantage row); left out, as TRL does.
+    scored = ~torch.isnan(delta)
     if not sequence_level:
+        keep = keep & scored
         return delta[keep], flat_is_ratio[keep]
     # A row with no kept tokens is exp(0) = 1, as in TRL.
     counts = keep.sum(dim = -1)
@@ -5154,7 +5263,7 @@ def _unsloth_grpo_is_metric_values(delta, flat_is_ratio, mask, sequence_level):
         (flat_is_ratio * keep).sum(dim = -1) / counts.clamp(min = 1),
         torch.ones_like(counts, dtype = flat_is_ratio.dtype),
     )
-    return delta[keep], per_row
+    return delta[keep & scored], per_row[scored.all(dim = -1)]
 
 
 def _unsloth_grpo_nanmin(tensor):
@@ -5261,6 +5370,7 @@ RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_flush_metric
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_defer_metric))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_sample_weight_mode))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_rollout_logps_as_old))
+RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_old_logps_from_new))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_trl_masks_unscorable))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_sample_weight))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_grpo_vision_inputs))
@@ -5277,12 +5387,15 @@ RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_reject_grpo_image
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_clear_stateful_mrope))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(grpo_compute_loss))
 RL_PRE_ITEMS["grpo_trainer"].append(_class_source(UnslothEfficientGRPO))
+RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_unsloth_seq_packing_verify_verdict))
 RL_PRE_ITEMS["grpo_trainer"].append(
-    _patch_grpo_accumulated_loss_prefix_grouper_kill(
-        _patch_grpo_accumulated_loss_prefix_grouper_vllm_gate(
-            _patch_grpo_accumulated_loss_prefix_grouper_gate(
-                _patch_grpo_accumulated_loss_head_hooks(
-                    _patch_grpo_accumulated_loss_hidden_states_dispatch(grpo_accumulated_loss)
+    _patch_grpo_accumulated_loss_seq_packing_kill(
+        _patch_grpo_accumulated_loss_prefix_grouper_kill(
+            _patch_grpo_accumulated_loss_prefix_grouper_vllm_gate(
+                _patch_grpo_accumulated_loss_prefix_grouper_gate(
+                    _patch_grpo_accumulated_loss_head_hooks(
+                        _patch_grpo_accumulated_loss_hidden_states_dispatch(grpo_accumulated_loss)
+                    )
                 )
             )
         )
@@ -5367,6 +5480,7 @@ def grpo_trainer_compute_loss(function_name, function):
         sampling_per_token_logps = inputs.get("sampling_per_token_logps", None)
         tool_mask = inputs.get("tool_mask", None)
         _rollout_logps_as_old = inputs.get("unsloth_rollout_logps_as_old", None) is not None
+        _old_logps_from_new = inputs.get("unsloth_old_logps_from_new", None) is not None
         # The logps pass is skipped under vLLM / beta = 0, but the zoo loss still packs.
         _unsloth_grpo_refuse_boundary_blind_packing(self, model)
         _unsloth_grpo_refuse_rank_local_forwards(self, model)
@@ -5467,6 +5581,8 @@ def grpo_trainer_compute_loss(function_name, function):
                 )
             if _rollout_logps_as_old:
                 old_logps, sampling_per_token_logps = sampling_per_token_logps, None
+            elif _old_logps_from_new and old_logps is None:
+                old_logps = per_token_logps.detach()
             (
                 loss,
                 completion_length,
@@ -5590,6 +5706,8 @@ def grpo_trainer_compute_loss(function_name, function):
                 _grpo_accumulated_loss_kwargs["tool_mask"] = tool_mask
             if _rollout_logps_as_old:
                 _grpo_accumulated_loss_kwargs["rollout_logps_as_old"] = True
+            if _old_logps_from_new:
+                _grpo_accumulated_loss_kwargs["old_logps_from_new"] = True
             if hasattr(self.args, "loss_type"):
                 (
                     loss,
@@ -6996,10 +7114,18 @@ def _unsloth_stock_logps_hook(
 ):
     """False when a subclass overrides one of ``hooks`` below the class whose ``method`` is the rewritten one: TRL's
     body would call the override (or it reads the full logits the chunked path replaces with stand-ins)."""
+
+    def own(klass, name):
+        # The shared-prefix wrapper (dpo_prefix_share.py) only scopes the call; read through it.
+        function = vars(klass).get(name)
+        if getattr(function, "_unsloth_dpo_prefix_share", False):
+            function = getattr(function, "__wrapped__", function)
+        return function
+
     owner = None
     for klass in type(self).__mro__:
         # The rewritten body calls a chunked or fused-pass helper; a subclass method wrapping it via super() does not.
-        names = getattr(getattr(vars(klass).get(method), "__code__", None), "co_names", ())
+        names = getattr(getattr(own(klass, method), "__code__", None), "co_names", ())
         if any(
             name.startswith("_unsloth_") and ("chunked" in name or "fused_pass" in name)
             for name in names
@@ -7009,7 +7135,15 @@ def _unsloth_stock_logps_hook(
     if owner is None:
         return True
     for name in hooks:
-        hook = next((klass for klass in type(self).__mro__ if name in vars(klass)), None)
+        hook = next(
+            (
+                klass
+                for klass in type(self).__mro__
+                if name in vars(klass)
+                and not getattr(vars(klass)[name], "_unsloth_dpo_prefix_share", False)
+            ),
+            None,
+        )
         if hook is not None and hook not in owner.__mro__:
             return False
     return True
