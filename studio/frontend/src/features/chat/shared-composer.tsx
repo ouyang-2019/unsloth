@@ -13,6 +13,7 @@ import { offloadCountsFrom, offloadWarning } from "./lib/partial-offload";
 import { llamaServerLoadFields } from "./lib/load-request";
 import {
   clearedServerTuningState,
+  committedMlxServerTuningState,
   committedServerTuningState,
 } from "./lib/server-tuning-fields";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
@@ -229,10 +230,7 @@ import {
 import { compareModelDisplayName } from "./lib/external-model-label";
 import { useExternalProvidersStore } from "./stores/external-providers-store";
 import { useComposerPillFit } from "@/hooks/use-composer-pill-fit";
-import {
-  COMPOSER_MIN_ROWS,
-  useComposerMaxRows,
-} from "@/hooks/use-composer-rows";
+import { useComposerMaxRows } from "@/hooks/use-composer-rows";
 import { useUiSpaceScale } from "@/hooks/use-ui-space-scale";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useT } from "@/i18n";
@@ -1246,9 +1244,7 @@ export function SharedComposer({
   // The single composer's editor frame (animated height), measured by hand: no autosize here.
   const inputId = useId();
   const uiSpaceScale = useUiSpaceScale();
-  const minEditorHeight = Math.round(
-    (16 + 24 * COMPOSER_MIN_ROWS) * uiSpaceScale,
-  );
+  const minEditorHeight = Math.round((16 + 24) * uiSpaceScale);
   const maxRows = useComposerMaxRows(24 * uiSpaceScale);
   const maxRowsRef = useRef(maxRows);
   maxRowsRef.current = maxRows;
@@ -1920,6 +1916,7 @@ export function SharedComposer({
           ...llamaServerLoadFields(ownConfig, {
             isGguf: targetIsGguf,
             isDiffusion: resolvedIsDiffusion === true,
+            isMlx: targetIsMlx,
           }),
           // GGUF-only: a non-GGUF target must not inherit a hidden GGUF GPU pick. A manual DiffusionGemma
           // split keeps its layer count, or it is judged a full-GGUF occupant.
@@ -2121,11 +2118,11 @@ export function SharedComposer({
             ? (ownConfig.nParallel ?? null)
             : null;
         const committedNBatch =
-          targetIsGguf && !(resp.is_diffusion ?? false)
+          (targetIsGguf || targetIsMlx) && !(resp.is_diffusion ?? false)
             ? (ownConfig.nBatch ?? null)
             : null;
         const committedNUbatch =
-          targetIsGguf && !(resp.is_diffusion ?? false)
+          (targetIsGguf || targetIsMlx) && !(resp.is_diffusion ?? false)
             ? (ownConfig.nUbatch ?? null)
             : null;
         useChatRuntimeStore.setState({
@@ -2144,27 +2141,27 @@ export function SharedComposer({
           nParallel: committedSlots,
           loadedNParallel: committedSlots,
           reasoningBudget:
-            targetIsGguf && !(resp.is_diffusion ?? false)
+            (targetIsGguf || targetIsMlx) && !(resp.is_diffusion ?? false)
               ? (resp.reasoning_budget ?? ownConfig.reasoningBudget)
               : -1,
           loadedReasoningBudget:
-            targetIsGguf && !(resp.is_diffusion ?? false)
+            (targetIsGguf || targetIsMlx) && !(resp.is_diffusion ?? false)
               ? (resp.reasoning_budget ?? ownConfig.reasoningBudget)
               : -1,
           reasoningBudgetMessage:
-            targetIsGguf && !(resp.is_diffusion ?? false)
+            (targetIsGguf || targetIsMlx) && !(resp.is_diffusion ?? false)
               ? (resp.reasoning_budget_message ??
                 ownConfig.reasoningBudgetMessage)
               : "",
           loadedReasoningBudgetMessage:
-            targetIsGguf && !(resp.is_diffusion ?? false)
+            (targetIsGguf || targetIsMlx) && !(resp.is_diffusion ?? false)
               ? (resp.reasoning_budget_message ??
                 ownConfig.reasoningBudgetMessage)
               : "",
-          loadedReasoningBudgetRequested: targetIsGguf && !resp.is_diffusion
+          loadedReasoningBudgetRequested: (targetIsGguf || targetIsMlx) && !resp.is_diffusion
             ? (resp.requested_reasoning_budget ?? ownConfig.reasoningBudget)
             : -1,
-          loadedReasoningBudgetMessageRequested: targetIsGguf && !resp.is_diffusion
+          loadedReasoningBudgetMessageRequested: (targetIsGguf || targetIsMlx) && !resp.is_diffusion
             ? (resp.requested_reasoning_budget_message ?? ownConfig.reasoningBudgetMessage)
             : "",
           nBatch: committedNBatch,
@@ -2173,7 +2170,9 @@ export function SharedComposer({
           loadedNUbatch: committedNUbatch,
           ...(targetIsGguf && !(resp.is_diffusion ?? false)
             ? committedServerTuningState(ownConfig)
-            : clearedServerTuningState()),
+            : targetIsMlx
+              ? committedMlxServerTuningState(ownConfig)
+              : clearedServerTuningState()),
           // The status applier is held off during the load, so record this pane's args now.
           loadedLlamaExtraArgs:
             resp.requested_llama_extra_args !== undefined

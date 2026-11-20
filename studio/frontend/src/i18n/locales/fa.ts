@@ -179,6 +179,7 @@ export const fa = {
       add: "افزودن",
       cancel: "لغو",
       removeSite: "حذف {site}",
+      hostOnly: "فقط همین میزبان، نه زیردامنه\u200cهای آن",
       permissionsNote:
         "فقط سایت‌هایی که مجوزهای مخصوص به خود دارند اینجا نمایش داده می‌شوند. اقدامات شامل ورود به حساب، ارسال فرم‌ها و دکمه‌هایی است که خرید، ارسال یا حذف انجام می‌دهند.",
       siteInvalid: "سایتی مانند example.com یا *.example.com وارد کنید.",
@@ -804,6 +805,7 @@ export const fa = {
     failed:
       "نصب موتور ناموفق بود. دوباره تلاش کنید یا از موتور پیش‌فرض استفاده کنید.",
     details: "جزئیات فنی",
+    lastAttempt: "آخرین تلاش: {time}",
     cancelled: "نصب لغو شد. می‌توانید دوباره تلاش کنید.",
     scope:
       "گفتگوی متنی و تصویری روی GPUهای NVIDIA. اولین بارگذاری ممکن است بیشتر طول بکشد.",
@@ -975,7 +977,6 @@ export const fa = {
     copy: "کپی",
     addScheduledTask: "افزودن کار زمان‌بندی‌شده…",
     compact: "فشرده‌سازی گفتگو",
-    compactQueued: "فشرده‌سازی برای پیام بعدی درخواست شد",
     compactEmpty: "هنوز چیزی برای فشرده‌سازی وجود ندارد",
     compactUnsupported:
       "فشرده‌سازی به یک مدل GGUF یا MLX با پشتیبانی از ابزار نیاز دارد",
@@ -1856,6 +1857,12 @@ export const fa = {
       learnMore: "بیشتر بدانید",
       managedNote:
         "مالک این سرور Unsloth سندباکس سیستم‌عامل را راه‌اندازی می‌کند.",
+      trustedFoldersTitle: "پوشه‌های مورد اعتماد",
+      trustedFoldersLabel: "اجرا بدون پرسیدن",
+      trustedFoldersDescription: "Python و ترمینال می‌توانند فایل‌های این پوشه‌ها را بدون درخواست تأیید بخوانند و اجرا کنند، فقط در گفتگوهای خودتان. نوشتن در آن‌ها همچنان تأیید می‌خواهد. هر پوشه در یک خط.",
+      trustedFoldersPlaceholder: "/Users/you/tools",
+      trustedFoldersLoadError: "بارگیری پوشه‌های مورد اعتماد ممکن نشد.",
+      trustedFoldersSaveError: "ذخیرهٔ پوشه‌های مورد اعتماد ممکن نشد.",
     },
     debugging: {
       description: "گزارش‌های Unsloth را بدون خروج از برنامه بخوانید.",
@@ -3334,6 +3341,7 @@ export const fa = {
       groups: {
         replies: { title: "پاسخ‌ها" },
         thinkingTools: { title: "تفکر و ابزارها" },
+        customization: { title: "شخصی‌سازی" },
         conversations: {
           title: "گفتگوها",
         },
@@ -3386,6 +3394,10 @@ export const fa = {
         fitOnDeviceOnly: "فقط مدل‌هایی که جا می‌شوند",
         fitOnDeviceOnlyDescription:
           "مدل‌هایی که برای حافظهٔ GPU و RAM این دستگاه بیش از حد بزرگ هستند در انتخابگر مدل و Hub پنهان شوند. مدل‌های دانلودشده همچنان نمایش داده می‌شوند.",
+        pickerExpandLoaded: "نمایش فهرست کامل مدل‌ها",
+        pickerExpandLoadedDescription: "وقتی مدلی بارگذاری شده است، انتخابگر مدل را با فهرست کامل باز کن، نه فقط مدل بارگذاری‌شده. باز یا بسته کردن انتخابگر نیز این تنظیم را تغییر می‌دهد.",
+        pickerMonochromeIcons: "آیکون‌های تک‌رنگ مدل",
+        pickerMonochromeIconsDescription: "لوگوهای مدل و ارائه‌دهنده را در انتخابگر مدل به رنگ سیاه، سفید و خاکستری نمایش بده.",
       },
       menu: {
         title: "منوی گفتگو",

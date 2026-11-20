@@ -745,20 +745,28 @@ def cutlass_wanted(capability: Optional[tuple]) -> bool:
         return False
 
 
+@lru_cache(maxsize = 4)
+def _sources_digest(lib: Optional[str]) -> str:
+    """Both sources and the loaded library, hashed once per process: the plan asks once per weight shape."""
+    import hashlib
+
+    from . import diffusion_int8_cutlass as cut
+
+    h = hashlib.sha256(open(__file__, "rb").read())
+    h.update(open(cut.__file__, "rb").read())
+    if lib:
+        h.update(open(lib, "rb").read())
+    return h.hexdigest()[:20]
+
+
 def _cut_cache_key(index: int) -> Optional[str]:
     """Card, toolchain, library build and both sources: any change re-races."""
     try:
-        import hashlib
-
         import torch
 
         from . import diffusion_int8_cutlass as cut
 
-        h = hashlib.sha256(open(__file__, "rb").read())
-        h.update(open(cut.__file__, "rb").read())
-        lib = cut.library_path()
-        if lib:
-            h.update(open(lib, "rb").read())
+        digest = _sources_digest(cut.library_path())
         try:
             import triton as _triton
             tv = _triton.__version__
@@ -776,7 +784,7 @@ def _cut_cache_key(index: int) -> Optional[str]:
                 os.environ.get(INT8_GEMM_UNLISTED_ENV, ""),
                 # the timing mode decides the huge-race winners: a plan raced the other way is re-raced
                 f"sustained={cut.sustained_mode()}",
-                h.hexdigest()[:20],
+                digest,
             )
         )
     except Exception:  # noqa: BLE001
@@ -2375,7 +2383,98 @@ def _gemm_probe_jobs(index: int) -> list:
     return [partial(_probe, index, cfg) for cfg in cfgs]
 
 
+# card index -> the early warm-up thread, and once it ran: (rotq, producer, gemm jobs, launches)
+_EARLY_PREWARM: dict = {}
+_EARLY_DONE: dict = {}
+_EARLY_LOCK = threading.Lock()
+
+
+def _early_prewarm_run(index: int, rotated: bool, producer: bool, logger: Any) -> None:
+    try:
+        from .diffusion_convrot_quant import (
+            prewarm_probe_kernels,
+            producer_probe_pending,
+            rotq_probes_pending,
+        )
+
+        rotq = bool(rotated) and rotq_probes_pending(index)
+        prod = bool(rotated and producer) and producer_probe_pending(index)
+        extra = tuple(_gemm_probe_jobs(index))
+        ran = (
+            prewarm_probe_kernels(index, rotq = rotq, producer = prod, extra = extra, logger = logger)
+            if (extra or rotq or prod)
+            else 0
+        )
+        _EARLY_DONE[index] = (rotq, prod, len(extra), ran)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def start_early_probe_prewarm(
+    index: int,
+    *,
+    rotated: bool,
+    producer: bool,
+    logger: Any = None,
+) -> bool:
+    """Run ``_prewarm_probes``' compiles in a thread during the disk-bound load (saved 10-14 s on a new L4).
+
+    Joined once the pipeline is built, before any timed probe, so no timing runs beside it. Never raises."""
+    try:
+        from .diffusion_convrot_quant import probe_prewarm_enabled
+
+        if int8_gemm_mode() == "off" or not probe_prewarm_enabled():
+            return False
+        from .diffusion_convrot_quant import verdict_file_present
+
+        if verdict_file_present():
+            # Pending checks are unreliable this early (verdict keys not settled yet); the swap loads them.
+            return False
+        import torch
+
+        if not torch.cuda.is_available() or is_rocm_torch(torch):
+            return False
+        with _EARLY_LOCK:
+            if index in _EARLY_PREWARM or index in _EARLY_DONE:
+                return False
+            thread = threading.Thread(
+                target = _early_prewarm_run,
+                args = (index, rotated, producer, logger),
+                name = "unsloth-probe-prewarm-early",
+                daemon = True,
+            )
+            _EARLY_PREWARM[index] = thread
+        thread.start()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def join_early_probe_prewarm(index: Optional[int] = None) -> None:
+    """Wait for card ``index``'s early warm-up (all when None). No-op under tracing / graph capture. Never raises."""
+    try:
+        import torch
+
+        if torch.compiler.is_compiling():
+            return
+        try:
+            capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        except Exception:  # noqa: BLE001
+            capturing = False
+        if capturing:
+            return
+        with _EARLY_LOCK:
+            items = [(i, t) for i, t in _EARLY_PREWARM.items() if index is None or i == index]
+        for i, thread in items:
+            thread.join()
+            with _EARLY_LOCK:
+                _EARLY_PREWARM.pop(i, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _prewarm_probes(index: int, transformer: Any, rotated: bool, logger: Any) -> int:
+    join_early_probe_prewarm(index)
     try:
         from .diffusion_convrot_quant import (
             prewarm_probe_kernels,
@@ -2395,6 +2494,14 @@ def _prewarm_probes(index: int, transformer: Any, rotated: bool, logger: Any) ->
         extra = tuple(_gemm_probe_jobs(index))
         if not (extra or rotq or producer):
             return 0
+        early = _EARLY_DONE.get(index)
+        if (
+            early is not None
+            and early[0] >= rotq
+            and early[1] >= producer
+            and early[2] >= len(extra)
+        ):
+            return early[3]
         return prewarm_probe_kernels(
             index, rotq = rotq, producer = producer, extra = extra, logger = logger
         )

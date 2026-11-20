@@ -180,6 +180,7 @@ export const es419 = {
       add: "Agregar",
       cancel: "Cancelar",
       removeSite: "Quitar {site}",
+      hostOnly: "Solo este host, no sus subdominios",
       permissionsNote:
         "Aquí solo aparecen los sitios con permisos propios. Las acciones son inicios de sesión, envíos de formularios y botones que compran, envían o eliminan.",
       siteInvalid: "Escribe un sitio como example.com o *.example.com.",
@@ -810,6 +811,7 @@ export const es419 = {
     failed:
       "No se pudo instalar el motor. Vuelve a intentarlo o usa el motor predeterminado.",
     details: "Detalles técnicos",
+    lastAttempt: "Último intento: {time}",
     cancelled: "Instalación cancelada. Puedes volver a intentarlo.",
     scope:
       "Chat de texto e imagen en GPU NVIDIA. La primera carga puede tardar más.",
@@ -984,7 +986,6 @@ export const es419 = {
     copy: "Copiar",
     addScheduledTask: "Agregar tarea programada…",
     compact: "Compactar conversación",
-    compactQueued: "Se solicitó la compactación para el siguiente mensaje",
     compactEmpty: "Aún no hay nada que compactar",
     compactUnsupported:
       "La compactación requiere un modelo GGUF o MLX compatible con herramientas",
@@ -1880,6 +1881,12 @@ export const es419 = {
       learnMore: "Más información",
       managedNote:
         "El propietario de este servidor de Unsloth configura el sandbox del sistema.",
+      trustedFoldersTitle: "Carpetas de confianza",
+      trustedFoldersLabel: "Ejecutar sin preguntar",
+      trustedFoldersDescription: "Python y la Terminal pueden leer y ejecutar archivos de estas carpetas sin pedir aprobación, solo en tus propios chats. Escribir en ellas sigue pidiendo aprobación. Una carpeta por línea.",
+      trustedFoldersPlaceholder: "/Users/you/tools",
+      trustedFoldersLoadError: "No se pudieron cargar las carpetas de confianza.",
+      trustedFoldersSaveError: "No se pudieron guardar las carpetas de confianza.",
     },
     debugging: {
       description: "Lee los registros de Unsloth sin salir de la aplicación.",
@@ -3393,6 +3400,7 @@ export const es419 = {
       groups: {
         replies: { title: "Respuestas" },
         thinkingTools: { title: "Razonamiento y herramientas" },
+        customization: { title: "Personalización" },
         conversations: {
           title: "Conversaciones",
         },
@@ -3444,6 +3452,10 @@ export const es419 = {
         fitOnDeviceOnly: "Mostrar solo modelos que caben",
         fitOnDeviceOnlyDescription:
           "Oculta en el selector de modelos y en el Hub los modelos demasiado grandes para la memoria de GPU y la RAM de este dispositivo. Los modelos descargados siguen visibles.",
+        pickerExpandLoaded: "Mostrar la lista completa de modelos",
+        pickerExpandLoadedDescription: "Abre el selector de modelos en la lista completa mientras hay un modelo cargado, en lugar de solo el modelo cargado. Expandir o contraer el selector también cambia esta opción.",
+        pickerMonochromeIcons: "Iconos de modelos monocromáticos",
+        pickerMonochromeIconsDescription: "Muestra los logotipos de modelos y proveedores en negro, blanco y gris en el selector de modelos.",
       },
       menu: {
         title: "Menú del chat",
