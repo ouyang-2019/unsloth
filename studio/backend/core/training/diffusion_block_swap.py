@@ -250,9 +250,8 @@ def plan_swap(
     need_bytes: int = 0,
     depth: int = 2,
 ) -> list:
-    """Blocks to swap per list. block_bytes = [[bytes per block] per list]; request = N (spread over the lists by
-    length) or "auto" (the smallest equal fraction of every list whose freed bytes, net of the depth + 1 slot pool,
-    cover need_bytes). Returns [[indices] per list]."""
+    """Returns [[indices] per list]; N is spread by list length, auto takes the smallest equal
+    fraction of every list whose freed bytes, net of the depth + 1 slot pool, cover need_bytes."""
     lens = [len(b) for b in block_bytes]
     total = sum(lens)
     if not total:
@@ -478,6 +477,7 @@ def compile_swapped_blocks(
     transformer,
     fullgraph: bool,
     dynamic: bool = True,
+    options: Optional[dict] = None,
 ) -> int:
     """Regional compile that leaves the swap hooks outside the graph: each repeated block's forward is compiled,
     not its _call_impl (whose pre / post hooks would be a graph break, an error under fullgraph)."""
@@ -486,7 +486,9 @@ def compile_swapped_blocks(
     n = 0
     for _, mod in swap_block_lists(transformer):
         for block in mod:
-            block.forward = torch.compile(block.forward, fullgraph = fullgraph, dynamic = dynamic)
+            block.forward = torch.compile(
+                block.forward, fullgraph = fullgraph, dynamic = dynamic, options = options
+            )
             n += 1
     return n
 

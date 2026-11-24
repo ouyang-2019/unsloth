@@ -304,6 +304,11 @@ from utils.happy_eyeballs import activate_happy_eyeballs
 activate_native_tls()
 activate_happy_eyeballs()
 
+# accelerate's meta init patches torch process-wide; Studio builds skeletons from several threads at once.
+from utils.meta_init import install_on_import as _install_thread_safe_meta_init
+
+_install_thread_safe_meta_init()
+
 # `uvicorn main:app` bypasses run.py; seed thread caps here too.
 from utils.cpu_threads import configure_cpu_threads
 
@@ -639,6 +644,15 @@ def _run_llama_cpp_startup_probes(app: FastAPI) -> None:
         _bin = LlamaCppBackend._find_llama_server_binary()
         _caps = LlamaCppBackend.probe_server_capabilities(_bin)
         app.state.llama_cpp_capabilities = _caps
+        # Warm the --version cache read by the first GGUF load.
+        if _caps.get("found"):
+            try:
+                LlamaCppBackend.probe_build_number(_bin)
+            except Exception as _build_exc:
+                import structlog as _structlog
+                _structlog.get_logger(__name__).debug(
+                    "llama.cpp build probe failed: %s", _build_exc
+                )
         _freshness = check_prebuilt_freshness(_bin)
         app.state.llama_cpp_freshness = _freshness
 
@@ -1815,8 +1829,7 @@ async def _send_411(send) -> None:
 
 
 async def _send_401(send) -> None:
-    # The status and detail the route's own auth check gives an expired or missing token, so the
-    # frontend refreshes its session exactly as it would have.
+    # Same 401 and detail as the route's own auth check, so the frontend refreshes its session.
     payload = _json_for_413.dumps({"detail": "Invalid or expired token"}).encode("utf-8")
     await send(
         {
@@ -3839,8 +3852,17 @@ def setup_frontend(
             raise HTTPException(status_code = 404, detail = "Not Found")
         if not _frontend_request_allowed(request):
             return Response(status_code = 404)
+        # No asset is this long, and resolving a deep path costs the square of its parts on the event loop.
+        if len(full_path) > 1024:
+            return Response(status_code = 404)
 
-        file_path = (build_path / full_path).resolve()
+        from utils.datasets.remote_images import is_network_share
+
+        joined = build_path / full_path
+        # Unauthenticated: resolve() on a share path makes Windows sign in to that host (NTLM).
+        if is_network_share(full_path) or is_network_share(str(joined)):
+            return Response(status_code = 404)
+        file_path = joined.resolve()
 
         if not file_path.is_relative_to(build_path.resolve()):
             return Response(status_code = 403)
