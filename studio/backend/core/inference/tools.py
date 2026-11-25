@@ -105,6 +105,7 @@ from core.inference.mcp_client import (
     is_studio_tools,
     is_stdio,
     list_tools_async,
+    needs_discovery,
     oauth_client_kwargs,
     parse_server_headers,
     parse_stdio_command,
@@ -2446,6 +2447,67 @@ def _find_blocked_commands(command: str, posix: "bool | None" = None) -> set[str
 
 # Holds the sandbox sitecustomize.py shim; put on the child's PYTHONPATH in _build_safe_env.
 _SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
+_sandbox_site_bytecode_for: "tuple | None" = None
+_sandbox_site_bytecode_lock = threading.Lock()
+
+
+def _sandbox_site_pyc(shim: str) -> str:
+    """Where a default child looks, whatever this host's PYTHONPYCACHEPREFIX or -O."""
+    tag = sys.implementation.cache_tag
+    return os.path.join(os.path.dirname(shim), "__pycache__", f"sitecustomize.{tag}.pyc")
+
+
+def _pyc_matches_source(cfile: str, source: bytes) -> bool:
+    import importlib.util
+    try:
+        with open(cfile, "rb") as stream:
+            header = stream.read(16)
+    except OSError:
+        return False
+    return (
+        len(header) == 16
+        and header[:4] == importlib.util.MAGIC_NUMBER
+        and int.from_bytes(header[4:8], "little") == 0b11
+        and header[8:16] == importlib.util.source_hash(source)
+    )
+
+
+def _ensure_sandbox_site_bytecode() -> None:
+    """The sandboxes mount the shim read-only, so a child recompiled it on every start (~12 ms). Checked
+    hash (PEP 552): validated against the source bytes, so an edit never runs stale bytecode."""
+    global _sandbox_site_bytecode_for
+    if sys.dont_write_bytecode:
+        return
+    shim = os.path.join(_SANDBOX_SITE_DIR, "sitecustomize.py")
+    try:
+        source_stat = os.stat(shim)
+    except OSError:
+        return
+    key = (shim, source_stat.st_mtime_ns, source_stat.st_size)
+    if _sandbox_site_bytecode_for == key:
+        return
+    with _sandbox_site_bytecode_lock:
+        if _sandbox_site_bytecode_for == key:
+            return
+        try:
+            import py_compile
+
+            cfile = _sandbox_site_pyc(shim)
+            with open(shim, "rb") as stream:
+                source = stream.read()
+            if not _pyc_matches_source(cfile, source):
+                py_compile.compile(
+                    shim,
+                    cfile = cfile,
+                    doraise = True,
+                    invalidation_mode = py_compile.PycInvalidationMode.CHECKED_HASH,
+                )
+        except Exception:  # noqa: BLE001 - bytecode is an optimization, never a launch failure
+            logger.debug("could not write the sandbox shim bytecode", exc_info = True)
+        _sandbox_site_bytecode_for = (
+            key  # also on failure: a read-only install would compile per call
+        )
+
 
 # Auto mode prompting gate; fails closed: anything not provably read-only asks.
 _AUTO_SAFE_TERMINAL_COMMANDS = frozenset(
@@ -5750,6 +5812,44 @@ def classifying_under(sandbox_level: "str | None"):
         yield
     finally:
         _classifying_sandbox_level.reset(token)
+
+
+class PythonCallAnalyses:
+    """Per-call cache of static Python analyses keyed by exact source; never share across calls."""
+
+    __slots__ = ("_by_source",)
+
+    def __init__(self) -> None:
+        self._by_source: "dict[str, tuple]" = {}
+
+
+_python_call_analyses: "ContextVar[PythonCallAnalyses | None]" = ContextVar(
+    "unsloth_python_call_analyses", default = None
+)
+
+
+@contextlib.contextmanager
+def using_python_call_analyses(analyses: "PythonCallAnalyses | None"):
+    if analyses is None:
+        yield
+        return
+    token = _python_call_analyses.set(analyses)
+    try:
+        yield
+    finally:
+        _python_call_analyses.reset(token)
+
+
+def _signal_escape_analysis(code: str):
+    """Cached `_check_signal_escape_patterns`; safe because it reads only the source and constants."""
+    analyses = _python_call_analyses.get()
+    if analyses is None or type(code) is not str:
+        return _check_signal_escape_patterns(code)
+    found = analyses._by_source.get(code)
+    if found is None:
+        found = _check_signal_escape_patterns(code)
+        analyses._by_source[code] = found
+    return found
 
 
 # Both run the command through cmd.exe: the isolated one inside MXC, the fallback on a host without Git Bash.
@@ -9074,7 +9174,7 @@ def _python_is_high_risk(code: str) -> bool:
     if not code or not code.strip():
         return False
     # A confirmation beats a silent refusal at execution time.
-    analysis = _check_signal_escape_patterns(code)
+    analysis = _signal_escape_analysis(code)
     if _check_code_safety(code, analysis = analysis) is not None:
         return True
     if any(_terminal_is_high_risk(command) for command in analysis[1].get("shell_commands", ())):
@@ -9865,6 +9965,7 @@ def _build_safe_env(workdir: str, shell: "str | None" = None) -> dict[str, str]:
     path, git_ext = _safe_path(shell)
     venv = os.environ.get("VIRTUAL_ENV")
     temp_dir = _sandbox_temp_dir(workdir)
+    _ensure_sandbox_site_bytecode()
     env = {
         "PATH": path,
         "HOME": workdir,
@@ -13998,9 +14099,7 @@ _MCP_LISTING_QUERY: ContextVar = ContextVar("mcp_listing_query", default = "")
 _MCP_LISTING_FORCED: ContextVar = ContextVar("mcp_listing_forced", default = None)
 _MCP_LISTING_IMAGE: ContextVar = ContextVar("mcp_listing_image", default = False)
 _MCP_LISTING_REMEMBER: ContextVar = ContextVar("mcp_listing_remember", default = True)
-_MCP_PROJECT_SERVER_IDS: ContextVar[frozenset[str] | None] = ContextVar(
-    "mcp_project_server_ids", default = None
-)
+_MCP_SERVER_IDS: ContextVar[frozenset[str] | None] = ContextVar("mcp_server_ids", default = None)
 # A dict set per request, so the listing can fill it from a thread running in a copy of the request's context.
 _MCP_LISTING_MATCHES: ContextVar = ContextVar("mcp_listing_matches", default = None)
 # (account, thread) -> MCP tools the thread ran while they were deferred, oldest first.
@@ -14896,20 +14995,24 @@ def mcp_project_excludes(server_id: str, session_id: str | None) -> bool:
     return selected is not None and server_id not in selected
 
 
+def set_mcp_server_scope(server_ids: frozenset[str] | None) -> None:
+    _MCP_SERVER_IDS.set(server_ids)
+
+
 async def set_mcp_project_scope(session_id: str | None) -> None:
     selected = (
         await asyncio.to_thread(_mcp_project_server_ids, session_id)
         if session_id and session_id.startswith(_PROJECT_SESSION_PREFIX)
         else None
     )
-    _MCP_PROJECT_SERVER_IDS.set(selected)
+    set_mcp_server_scope(selected)
 
 
 def _enabled_mcp_servers(servers: list[dict]) -> list[dict]:
     from core.inference.studio_tools_mcp import keyless_caller
 
     keyless = keyless_caller(current_account())
-    selected = _MCP_PROJECT_SERVER_IDS.get()
+    selected = _MCP_SERVER_IDS.get()
     enabled = [
         server
         for server in servers
@@ -14976,12 +15079,7 @@ async def get_enabled_mcp_tools(
 
     # cool-off avoids blocking every send for the full probe timeout when a server is down. The in-process
     # Unsloth Studio row is re-listed every send, so tool toggles apply at once.
-    uncached = [
-        s
-        for s in servers
-        if is_studio_tools(s["url"])
-        or (get_cached_tools(s["id"]) is None and not in_failure_cooloff(s["id"]))
-    ]
+    uncached = [s for s in servers if is_studio_tools(s["url"]) or needs_discovery(s["id"])]
     if uncached:
         results = await asyncio.gather(
             *(_discover_mcp_tools(s) for s in uncached), return_exceptions = True
@@ -15095,6 +15193,12 @@ def mcp_session_scope(session_id: "str | None", thread_id: "str | None") -> "str
     return f"s={quote(session_id or '', safe = '')}:t={quote(thread_id, safe = '')}"
 
 
+def close_mcp_thread_sessions(thread_id: str) -> None:
+    from core.inference.mcp_client import close_mcp_scopes
+    suffix = f":t={urllib.parse.quote(thread_id, safe = '')}"
+    close_mcp_scopes(lambda scope: scope.endswith(suffix))
+
+
 _TIMEOUT_UNSET = object()
 
 
@@ -15139,6 +15243,7 @@ def execute_tool(
     host_access_approved: bool = False,
     mcp_image = None,
     started_read: "StartedUrlRead | None" = None,
+    python_analyses: "PythonCallAnalyses | None" = None,
 ) -> str:
     """Runs a tool by name; disable_sandbox skips python/terminal checks, blocklist and caps (secrets stay stripped); tool_execution_mode full is refused here."""
     from state.tool_policy import require_tool_access
@@ -15306,6 +15411,9 @@ def execute_tool(
             return f"Error: MCP server '{display}' is disabled"
         if mcp_project_excludes(server_id, session_id):
             return f"Error: MCP server '{display}' is not enabled for this project"
+        selected = _MCP_SERVER_IDS.get()
+        if selected is not None and server_id not in selected:
+            return f"Error: MCP server '{display}' is outside this run's selection"
         if _runs_local_mcp(server) and not stdio_mcp_enabled():
             return f"Error: stdio MCP server '{display}' is disabled on this host"
         mcp_scope = mcp_session_scope(session_id, thread_id)
@@ -15441,7 +15549,7 @@ def execute_tool(
         )
     # Both run with the session's sandbox as cwd, so a chat deleted mid-call must not unlink it from under them.
     if name == "python":
-        with _session_in_flight(session_id):
+        with _session_in_flight(session_id), using_python_call_analyses(python_analyses):
             return _python_exec(
                 arguments.get("code", ""),
                 cancel_event,
@@ -16093,7 +16201,13 @@ def _build_rag_autoinject(conversation: list[dict], rag_scope: dict | None) -> d
     thread_id = rag_scope.get("thread_id")
     query = _last_user_text(conversation)
     try:
-        from core.rag.tool import render_sources, search_for_autoinject, whole_document_context
+        from core.inference import instruction_pin
+        from core.rag.tool import (
+            document_opening,
+            render_sources,
+            search_for_autoinject,
+            whole_document_context,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("RAG auto-inject unavailable: %s", exc)
         return None
@@ -16174,6 +16288,7 @@ def _build_rag_autoinject(conversation: list[dict], rag_scope: dict | None) -> d
         return _trim(found[0], found[1], max_tokens) if found else None
 
     thread_docs = _thread_document_ids(thread_id) if whole_doc_requested and text is None else set()
+    opening_ids: set = set()
 
     def retrieve_thread_unfloored(*, max_tokens = None):
         # Lexical-only misses generic requests ("summarize this"), so retry with the dense leg.
@@ -16190,7 +16305,39 @@ def _build_rag_autoinject(conversation: list[dict], rag_scope: dict | None) -> d
                 min_dense_score = None,
                 mode = "hybrid",
             )
-        return found
+        if not found or _strong_thread_match():
+            return found
+        # Nothing clears the floor ("summarize this" ranks mid-document scraps), so the matched file's opening leads.
+        opening = document_opening(
+            scope_thread_id = thread_id, document_id = found[1][0].get("documentId")
+        )
+        if not opening:
+            return found
+        seen = {s["chunkId"] for s in opening}
+        hits = [s for s in found[1] if s.get("chunkId") not in seen]
+        merged = opening + hits
+        kept = _trim(
+            render_sources(merged), merged, max_tokens, keep_first = len(opening) + bool(hits)
+        )
+        if kept is None:
+            # render_sources renumbered these hits in place for the merged list.
+            return render_sources(found[1]), found[1]
+        opening_ids.update(seen)
+        return kept
+
+    def _strong_thread_match() -> bool:
+        try:
+            return bool(
+                search_for_autoinject(
+                    query = query,
+                    scope_thread_id = thread_id,
+                    top_k = 1,
+                    min_dense_score = floor,
+                    mode = "dense",
+                )
+            )
+        except Exception:  # noqa: BLE001 - an unavailable dense leg keeps the plain top-k
+            return True
 
     # With auto-injection off, search the oversized attachment alone, unfloored; budget binds only here, so a small context cannot silently switch RAG off.
     if text is None and (enabled or whole_doc_requested):
@@ -16236,12 +16383,23 @@ def _build_rag_autoinject(conversation: list[dict], rag_scope: dict | None) -> d
                     if thread_found and found:
                         cited = thread_docs or {s.get("documentId") for s in thread_found[1]}
                         if not any(s.get("documentId") in cited for s in found[1]):
-                            # Still the lean top_k in total, so the unbudgeted path never doubles the injection.
+                            # The lean top_k plus the opening, so the unbudgeted path never doubles the injection.
                             n_proj = min(len(found[1]), top_k // 2)
-                            merged = thread_found[1][: top_k - n_proj] + found[1][:n_proj]
+                            n_open = sum(s.get("chunkId") in opening_ids for s in thread_found[1])
+                            merged = thread_found[1][: n_open + top_k - n_proj] + found[1][:n_proj]
                             found = (render_sources(merged), merged)
                     elif thread_found:
                         found = thread_found
+                if (
+                    not found
+                    and rag_scope.get("kb_id")
+                    and not instruction_pin.is_thin_query(query)
+                ):
+                    found = retrieve(
+                        scope_kb_id = rag_scope["kb_id"],
+                        min_dense_score = None,
+                        **_scope_retrieval_kwargs(rag_scope),
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning("RAG auto-inject retrieval failed: %s", exc)
             return None
@@ -16274,6 +16432,7 @@ _UNMEASURED_ROOM_MARGIN = 0.5
 _MIN_PAGE_CHARS = 2000
 # a percent escape is one non-ASCII byte in ASCII and tokenizes like one.
 _HEX_PAIR_RE = re.compile(r"[0-9A-Fa-f]{2}")
+_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 # raw cap exceeds _MAX_PAGE_CHARS because conversion strips large SSR <head> sections.
 _MAX_FETCH_BYTES = 512 * 1024
 # news pages can inline about 2.5 MB in <head>, so reserve _MAX_FETCH_BYTES beyond its end.
@@ -17888,18 +18047,56 @@ def _window_context_tokens() -> int | None:
     return ctx if ctx else None
 
 
+def _escape_aligned(text: str, index: int) -> int:
+    """Moves `index` past an escape covering it; a `%` is never inside an earlier escape."""
+    if index >= 2 and _ESCAPE_RE.match(text, index - 2):
+        return index + 1
+    if index >= 1 and _ESCAPE_RE.match(text, index - 1):
+        return index + 2
+    return index
+
+
+def _charged_quarters(piece: str) -> int:
+    """Cost in quarter tokens of a slice starting and ending on escape-aligned indices."""
+    cost = 4 * len(piece) - 3 * len(piece.encode("ascii", "ignore"))
+    if "%" in piece:
+        cost += 9 * len(_ESCAPE_RE.findall(piece))
+    return cost
+
+
 def _dense_prefix_chars(text: str, token_budget: float) -> int:
     """Charges non-ASCII one token each: CJK runs 1.3-1.6 chars per token, so the share stays a share."""
-    # Escape-free ASCII costs 0.25 a char: the loop would stop at floor(budget * 4).
-    if (
-        type(text) is str
-        and type(token_budget) in (int, float)
-        and text.isascii()
-        and 0.0 <= token_budget < 2**50
-    ):
-        end = min(len(text), int(token_budget * 4))
-        if text.find("%", 0, end + 1) < 0:
-            return end
+    if type(text) is str and type(token_budget) in (int, float) and 0.0 <= token_budget < 2**50:
+        # Quarter tokens: plain ASCII 1, non-ASCII 4, escape 12.
+        allowed = int(token_budget * 4)
+        length = len(text)
+        # Escape-free ASCII costs 0.25 a char: the loop would stop at floor(budget * 4).
+        if text.isascii() and text.find("%", 0, min(length, allowed) + 1) < 0:
+            return min(length, allowed)
+        # No char costs over 4, so the next quarter of the room nearly always fits: gallop on
+        # C-speed block sums, halving on an overshoot, then step the last few characters.
+        spent = 0
+        pos = 0
+        cap = length
+        while pos < length:
+            step = min(cap, max(16, (allowed - spent) // 4))
+            stop = _escape_aligned(text, min(length, pos + step))
+            cost = _charged_quarters(text[pos:stop])
+            if spent + cost <= allowed:
+                spent += cost
+                pos = stop
+            elif stop - pos > 18:
+                cap = (stop - pos) // 2
+            else:
+                break
+        else:
+            return length
+        while True:
+            width = 3 if _ESCAPE_RE.match(text, pos) else 1
+            spent += _charged_quarters(text[pos : pos + width])
+            if spent > allowed:
+                return pos
+            pos += width
     spent = 0.0
     index = 0
     length = len(text)
@@ -22320,7 +22517,7 @@ def _check_code_safety(
 ) -> str | None:
     """Validate code safety via static analysis. Returns an error message string if the code is
     unsafe, or None if OK. host_approved lets an approved call reach hosts off the allowlist."""
-    safe, info = analysis or _check_signal_escape_patterns(code)
+    safe, info = analysis or _signal_escape_analysis(code)
     # A literal `python -c PROGRAM` the code launches runs PROGRAM unscreened; screen it the same way.
     if _depth < 3 and not info.get("error"):
         for command in info.get("shell_commands", ()):
@@ -23978,11 +24175,14 @@ def _user_path_parts(parts: "list[str]", root: "str | None" = None) -> "list[str
 _SERVABLE_SEGMENT_RE = re.compile(r"\A[^/\\\x00-\x1f]{1,255}\Z")
 
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
 def _servable_segment(name: str) -> bool:
     if name in (".", "..") or not _SERVABLE_SEGMENT_RE.match(name):
         return False
     # Lone surrogates make encodeURIComponent throw.
-    return not any("\ud800" <= ch <= "\udfff" for ch in name)
+    return name.isascii() or _SURROGATE_RE.search(name) is None
 
 
 # Exact names we write, not a reserved pattern.
@@ -24115,13 +24315,14 @@ def _snapshot_workdir_views(workdir: "str | None", views: "tuple") -> "list":
         dirs[:] = [d for d in kept if d in children]
         for d in dirs:
             owners[os.path.join(base, d)] = children[d]
+        joined = os.path.join(base, "")
         for name in names:
             # ignore internal markers only at the root; nested files with these names remain valid artifacts.
             if base == workdir and name in _INTERNAL_SANDBOX_FILES:
                 continue
             if not _servable_segment(name):
                 continue
-            path = os.path.join(base, name)
+            path = joined + name
             try:
                 # one lstat replaces isfile, islink, and stat while rejecting the same non-regular entries.
                 stat = os.lstat(path)

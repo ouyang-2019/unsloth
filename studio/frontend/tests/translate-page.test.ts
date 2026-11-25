@@ -114,6 +114,42 @@ test("a line longer than a chunk breaks at sentence ends", () => {
   );
 });
 
+test("hard-wrapped text is cut between sentences, not inside one", () => {
+  const words =
+    "the court held that any party may seek relief under applicable law when".split(
+      " ",
+    );
+  const sentence = (i: number) =>
+    `${Array.from({ length: 6 + ((i * 7) % 15) }, (_, j) => words[(i + j) % words.length]).join(" ")}.`;
+  const wrap = (paragraph: string) =>
+    paragraph
+      .split(" ")
+      .reduce((lines, word) => {
+        const last = lines[lines.length - 1];
+        if (last && last.length + word.length < 90)
+          lines[lines.length - 1] = `${last} ${word}`;
+        else lines.push(word);
+        return lines;
+      }, [] as string[])
+      .join("\n");
+  const paragraphs = Array.from({ length: 6 }, (_, p) =>
+    wrap(Array.from({ length: 6 }, (_, s) => sentence(p * 6 + s)).join(" ")),
+  );
+  for (const source of [paragraphs.join("\n\n"), wrap(paragraphs.join(" "))]) {
+    const chunks = splitForTranslation(source);
+    assert.ok(chunks.length > 2);
+    assert.equal(rejoin(source), source);
+    for (const chunk of chunks.slice(0, -1)) {
+      assert.ok(chunk.text.length <= 1000);
+      assert.match(
+        chunk.text,
+        /\.$/,
+        `cut mid-sentence: ...${chunk.text.slice(-40)}`,
+      );
+    }
+  }
+});
+
 test("the translation keeps the source's own surrounding whitespace", () => {
   assert.equal(
     restoreChunkWhitespace({ text: "  Hello ", after: "\n\n" }, "\nBonjour\n"),
@@ -458,7 +494,7 @@ test("a stopped download and the chat model's own slot are honoured", () => {
     /\(outcome\) => \{[\s\S]*?if \(outcome === "started" && signal\.aborted\) cancelJob\(\);/,
   );
   const chat = runner.slice(runner.indexOf("async function chatModel"));
-  assert.match(chat, /getInferenceStatus\(signal, picked \|\| undefined\)/);
+  assert.match(chat, /getInferenceStatus\(signal, served \|\| undefined\)/);
   assert.match(chat, /isTranslationHeldSlot\(status\.active_model, picked\)/);
 });
 
