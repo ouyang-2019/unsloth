@@ -686,7 +686,8 @@ export const en = {
   },
   managedEngines: {
     gpu: "GPUs",
-    gpuHelp: "Choose which GPUs to use.",
+    gpuHelp:
+      "Choose which GPUs in this machine to use. Serving one model across machines (for example two DGX Sparks) is not part of this release.",
     parallelism: "Multi-GPU mode",
     tensor: "Tensor parallel",
     pipeline: "Pipeline parallel",
@@ -886,10 +887,17 @@ export const en = {
   chatMenu: {
     more: "Chat options",
     copy: "Copy",
-    addScheduledTask: "Add scheduled task…",
+    addScheduledTask: "Add scheduled task",
     compact: "Compact conversation",
     compactEmpty: "Nothing to compact yet",
     compactUnsupported: "Compaction requires a GGUF or MLX model with tool support",
+  },
+  chatFiles: {
+    title: "Files in this chat",
+    code: "Code snippets",
+    showInChat: "Show in chat",
+    download: "Download {name}",
+    saveFailed: "Could not save {name}.",
   },
   // The empty chat's greeting; {name} is the user's nickname or first name.
   welcome: {
@@ -970,6 +978,7 @@ export const en = {
     saving: "Saving...",
     search: "Search",
     shutdown: "Shutdown",
+    technicalDetails: "Technical details",
   },
   shell: {
     helpMenu: {
@@ -4117,7 +4126,7 @@ export const en = {
       alternative: "Try instead: {alternative}",
       override: "Choose mode and GPUs",
       overrideHint:
-        "Automatic picks the fastest mode that fits. Untick a GPU to leave it free for chat or another run.",
+        "Automatic picks the fastest mode that fits. Untick a GPU to leave it free for chat or another run. Training uses the GPUs in this machine only: multi-node training (for example two DGX Sparks) is not part of this release.",
       modeLabel: "Mode",
       specLabel: "Layout",
       unavailable: "Not available here",
@@ -4138,8 +4147,8 @@ export const en = {
       summary: {
         single: "Training on one GPU",
         layerSplit: "Model is split layer by layer across {count} GPUs",
-        ddp: "Model fits one GPU: data parallel on {count} GPUs",
-        fsdp2: "Model is too big for one GPU: sharded across {count} GPUs",
+        ddp: "Each GPU trains a full copy: data parallel on {count} GPUs",
+        fsdp2: "Weights and optimizer state sharded across {count} GPUs",
         tp: "Each layer is split across {count} GPUs",
         pp: "Layers run as {count} pipeline stages, one per GPU",
         cp: "Each sequence is split across {count} GPUs",
@@ -4150,7 +4159,7 @@ export const en = {
         noGpu: "Select at least one GPU.",
         singleNeedsOne: "Single GPU uses exactly one GPU. Untick the others.",
         needsTwo: "This mode needs at least two GPUs.",
-        customSpec: "Enter a layout, for example dp=2,tp=2.",
+        customSpec: "Enter a layout, for example {example}.",
       },
     },
     preview: {
@@ -4224,7 +4233,7 @@ export const en = {
       noDatasetsFound: "No datasets found.",
       tokenRejectedTitle: "Hugging Face token rejected",
       tokenRejectedBody: "Update your token in Settings → General, then retry.",
-      hubUnreachable: "Couldn't reach Hugging Face",
+      hubUnreachable: "Can't reach Hugging Face",
       cantUseDataset: "Can't use dataset",
       reasonInvalidHubId:
         "Enter a valid Hugging Face dataset ID: repo or owner/repo, with no consecutive periods or hyphens and no .git suffix (maximum 96 characters per part).",
@@ -4251,7 +4260,7 @@ export const en = {
       tokenRejectedBody: "Update your token in Settings → General, then retry.",
       tokenRejectedAnonymousBody:
         "Public models are shown without it. Update your token in Settings → General to reach private and gated models.",
-      hubUnreachable: "Couldn't reach Hugging Face",
+      hubUnreachable: "Can't reach Hugging Face",
       cantUseModel: "Can't use model for training",
       reasonTypeMismatch:
         "This model doesn't match the training type selected in the previous step.",
@@ -5054,6 +5063,7 @@ export const en = {
     model: {
       label: "Translation model",
       fast: "Fast",
+      balanced: "Balanced",
       quality: "Best quality",
       chat: "Chat model",
       recommended: "Recommended",
@@ -5076,11 +5086,11 @@ export const en = {
       toneFormal: "Formal",
       toneCasual: "Casual",
       auto: "Translate as you type",
-      autoDescription: "Starts once the model is loaded. Typing never starts a download.",
+      autoDescription: "Starts automatically when model is loaded.",
       saveHistory: "Save history",
       saveHistoryDescription: "Kept in this browser only.",
       showPrompt: "Show prompt",
-      showPromptDescription: "See the exact instructions sent to the model.",
+      showPromptDescription: "See exact instructions sent to the model.",
     },
     history: {
       title: "History",
@@ -5947,7 +5957,6 @@ export const en = {
     back: "Back",
     continue: "Continue",
     skipSetup: "Skip setup",
-    outsideAgain: "Click outside again to close",
     getStarted: "Get started",
     progress: "Step {current} of {total}",
     welcome: {
@@ -6153,6 +6162,12 @@ export const en = {
     maximize: "Maximize window",
     restore: "Restore window",
     close: "Close window",
+    mediaCodecs: {
+      title: "Generated videos may not play",
+      // {command}: an apt command line, never translated.
+      description: "This system is missing the GStreamer video decoders. Install them with: {command}",
+      copy: "Copy command",
+    },
   },
   runtimeUpdate: {
     // {component}: llama.cpp, whisper.cpp or audio.cpp; {components}: a list of them.

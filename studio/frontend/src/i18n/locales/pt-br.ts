@@ -882,10 +882,17 @@ export const ptBR = {
   chatMenu: {
     more: "Opções do chat",
     copy: "Copiar",
-    addScheduledTask: "Adicionar tarefa agendada…",
+    addScheduledTask: "Adicionar tarefa agendada",
     compact: "Compactar conversa",
     compactEmpty: "Ainda não há nada para compactar",
     compactUnsupported: "A compactação requer um modelo GGUF ou MLX com suporte a ferramentas",
+  },
+  chatFiles: {
+    title: "Arquivos nesta conversa",
+    code: "Trechos de código",
+    showInChat: "Mostrar na conversa",
+    download: "Baixar {name}",
+    saveFailed: "Não foi possível salvar {name}.",
   },
   welcome: {
     goodToSeeYou: "Que bom ver você",
@@ -969,6 +976,7 @@ export const ptBR = {
     saving: "Salvando...",
     search: "Buscar",
     shutdown: "Desligar",
+    technicalDetails: "Detalhes técnicos",
   },
   shell: {
     helpMenu: {
@@ -4138,8 +4146,8 @@ export const ptBR = {
       summary: {
         single: "Treinando em uma GPU",
         layerSplit: "O modelo é dividido camada por camada entre {count} GPUs",
-        ddp: "O modelo cabe em uma GPU: paralelismo de dados em {count} GPUs",
-        fsdp2: "O modelo é grande demais para uma GPU: fragmentado entre {count} GPUs",
+        ddp: "Cada GPU treina uma cópia completa: paralelismo de dados em {count} GPUs",
+        fsdp2: "Pesos e estado do otimizador fragmentados entre {count} GPUs",
         tp: "Cada camada é dividida entre {count} GPUs",
         pp: "As camadas rodam como {count} estágios de pipeline, um por GPU",
         cp: "Cada sequência é dividida entre {count} GPUs",
@@ -4150,7 +4158,7 @@ export const ptBR = {
         noGpu: "Selecione pelo menos uma GPU.",
         singleNeedsOne: "GPU única usa exatamente uma GPU. Desmarque as outras.",
         needsTwo: "Este modo precisa de pelo menos duas GPUs.",
-        customSpec: "Digite um layout, por exemplo dp=2,tp=2.",
+        customSpec: "Digite um layout, por exemplo {example}.",
       },
     },
     preview: {
@@ -5060,6 +5068,7 @@ export const ptBR = {
     model: {
       label: "Modelo de tradução",
       fast: "Rápido",
+      balanced: "Equilibrado",
       quality: "Melhor qualidade",
       chat: "Modelo do chat",
       recommended: "Recomendados",
@@ -5081,7 +5090,7 @@ export const ptBR = {
       toneFormal: "Formal",
       toneCasual: "Informal",
       auto: "Traduzir ao digitar",
-      autoDescription: "Começa assim que o modelo é carregado. Digitar nunca inicia um download.",
+      autoDescription: "Começa automaticamente quando o modelo é carregado.",
       saveHistory: "Salvar histórico",
       saveHistoryDescription: "Fica guardado apenas neste navegador.",
       showPrompt: "Mostrar prompt",
@@ -6053,6 +6062,12 @@ export const ptBR = {
     maximize: "Maximizar janela",
     restore: "Restaurar janela",
     close: "Fechar janela",
+    mediaCodecs: {
+      title: "Os vídeos gerados podem não ser reproduzidos",
+      // {command}: an apt command line, never translated.
+      description: "Faltam neste sistema os decodificadores de vídeo do GStreamer. Instale-os com: {command}",
+      copy: "Copiar comando",
+    },
   },
   runtimeUpdate: {
     installAudio: "Instalar o runtime de áudio",
@@ -6147,7 +6162,6 @@ export const ptBR = {
     back: "Voltar",
     continue: "Continuar",
     skipSetup: "Pular configuração",
-    outsideAgain: "Clique fora novamente para fechar",
     getStarted: "Começar",
     progress: "Etapa {current} de {total}",
     welcome: {

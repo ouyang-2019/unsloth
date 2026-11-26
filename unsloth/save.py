@@ -86,6 +86,7 @@ from .models._utils import (
 )
 from .models.mistral_format import raise_if_merging_mistral_format_view
 from .models.inkling2 import (
+    inkling2_lora_gguf_adapter,
     is_inkling2_config,
     raise_if_merging_inkling2,
     save_inkling2_merged_16bit,
@@ -6619,6 +6620,7 @@ def _unsloth_save_lora_gguf(
     model_name = _model_basename(base_model_id)
 
     base_config_dir = None
+    inkling2_dir = None
     # Save the adapter: an isolated temp dir for a hub push, else save_directory itself, wrapped so it is always cleaned up.
     if push_to_hub:
         lora_dir = tempfile.mkdtemp(prefix = "unsloth-lora-gguf-")
@@ -6646,7 +6648,19 @@ def _unsloth_save_lora_gguf(
             )
 
         out_gguf = os.path.join(lora_dir, f"{model_name}-lora-{outtype}.gguf")
-        cmd = [sys.executable, converter, lora_dir, "--outfile", out_gguf, "--outtype", outtype]
+        converter_input = lora_dir
+        if is_inkling2_config(getattr(model, "config", None)):
+            # The converter maps Inkling 2's original checkpoint names, PEFT saves transformers names.
+            converter_input = inkling2_dir = inkling2_lora_gguf_adapter(model, lora_dir)
+        cmd = [
+            sys.executable,
+            converter,
+            converter_input,
+            "--outfile",
+            out_gguf,
+            "--outtype",
+            outtype,
+        ]
         # Pass --trust-remote-code only when the model really came from custom code (the approved load decision), not merely because its config carries an auto_map entry.
         loaded_via_remote_code = _loaded_via_remote_code(model)
         # --base-model-id's strict AutoConfig rejects an older config (Ling-3.0-tiny's int kda_lower_bound, #13948); --base falls back to config.json.
@@ -6751,6 +6765,8 @@ def _unsloth_save_lora_gguf(
             shutil.rmtree(lora_dir, ignore_errors = True)
         if base_config_dir is not None:
             shutil.rmtree(base_config_dir, ignore_errors = True)
+        if inkling2_dir is not None:
+            shutil.rmtree(inkling2_dir, ignore_errors = True)
 
 
 @_model_parallel_refuses_save("push_to_hub_ggml")
@@ -9016,6 +9032,22 @@ def _restore_model_after_quantize_subprocess(model, restore_token) -> None:
         )
 
 
+def _report_lora_quant_survival(model, scheme, ignore_patterns):
+    """Log how much of a LoRA update the quantized export keeps; a diagnostic that never fails the export.
+    `ignore_patterns` are the modules the export leaves 16-bit."""
+    try:
+        from .utils.lora_quant_survival import report_lora_quant_survival
+        report_lora_quant_survival(
+            model,
+            scheme,
+            log = print,
+            warn = logger.warning,
+            skip = lambda name, module: _matches_ignore_pattern(name, module, ignore_patterns),
+        )
+    except Exception:
+        pass
+
+
 @_model_parallel_refuses_save("save_pretrained_merged")
 def _unsloth_save_compressed_tensors(
     model,
@@ -9109,6 +9141,7 @@ def _unsloth_save_compressed_tensors(
 
         # Merge to 16bit at local_dir via unsloth_generic_save, so adapters are merged and full-finetuned models written in 16bit alike. The subprocess reloads this staging checkpoint with default weight filenames, so never write variant-named shards here; the user's variant goes on the final compressed checkpoint.
         variant = merge_kwargs.pop("variant", None)
+        _report_lora_quant_survival(model, scheme, _compressed_ignore_patterns(model))
         print(f"Unsloth: Merging to 16bit before {scheme} quantization...")
         merge_args = dict(merge_kwargs)
         merge_args.update(
@@ -9370,6 +9403,9 @@ def _unsloth_save_torchao(
 
         # Merge to 16bit at a staging dir, LoRA and base alike. The reload reads default weight filenames, so never write variant-named shards here.
         merge_kwargs.pop("variant", None)
+        if kind == "fp8":
+            # torchao quantizes Linear weights only and keeps lm_head 16-bit.
+            _report_lora_quant_survival(model, "torchao_fp8", ["lm_head"])
         print(f"Unsloth: Merging to 16bit before torchao {kind} quantization...")
         merge_args = dict(merge_kwargs)
         merge_args.update(

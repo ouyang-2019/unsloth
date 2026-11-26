@@ -883,10 +883,17 @@ export const ja = {
   chatMenu: {
     more: "チャットのオプション",
     copy: "コピー",
-    addScheduledTask: "スケジュールタスクを追加…",
+    addScheduledTask: "スケジュールタスクを追加",
     compact: "会話を圧縮",
     compactEmpty: "まだ圧縮する内容がありません",
     compactUnsupported: "会話の圧縮にはツール対応のGGUFまたはMLXモデルが必要です",
+  },
+  chatFiles: {
+    title: "このチャットのファイル",
+    code: "コードスニペット",
+    showInChat: "チャットで表示",
+    download: "{name} をダウンロード",
+    saveFailed: "{name} を保存できませんでした。",
   },
   welcome: {
     goodToSeeYou: "お会いできてうれしいです",
@@ -968,6 +975,7 @@ export const ja = {
     saving: "保存中...",
     search: "検索",
     shutdown: "シャットダウン",
+    technicalDetails: "技術的な詳細",
   },
   shell: {
     helpMenu: {
@@ -4087,8 +4095,8 @@ export const ja = {
       summary: {
         single: "1 台の GPU でトレーニング",
         layerSplit: "モデルをレイヤーごとに GPU {count} 台へ分割",
-        ddp: "モデルは 1 台の GPU に収まります: GPU {count} 台でデータ並列",
-        fsdp2: "モデルが 1 台の GPU に収まりません: GPU {count} 台にシャード化",
+        ddp: "各 GPU が完全なコピーを学習: GPU {count} 台でデータ並列",
+        fsdp2: "重みとオプティマイザー状態を GPU {count} 台にシャード化",
         tp: "各レイヤーを GPU {count} 台に分割",
         pp: "レイヤーを {count} 段のパイプラインで実行（GPU ごとに 1 段）",
         cp: "各シーケンスを GPU {count} 台に分割",
@@ -4099,7 +4107,7 @@ export const ja = {
         noGpu: "GPU を 1 台以上選択してください。",
         singleNeedsOne: "単一 GPU は 1 台だけを使います。ほかのチェックを外してください。",
         needsTwo: "このモードには GPU が 2 台以上必要です。",
-        customSpec: "構成を入力してください（例: dp=2,tp=2）。",
+        customSpec: "構成を入力してください（例: {example}）。",
       },
     },
     preview: {
@@ -4980,6 +4988,7 @@ export const ja = {
     model: {
       label: "翻訳モデル",
       fast: "高速",
+      balanced: "バランス",
       quality: "最高品質",
       chat: "チャットモデル",
       recommended: "おすすめ",
@@ -5001,11 +5010,11 @@ export const ja = {
       toneFormal: "フォーマル",
       toneCasual: "カジュアル",
       auto: "入力と同時に翻訳",
-      autoDescription: "モデルの読み込み後に開始します。入力によってダウンロードが始まることはありません。",
+      autoDescription: "モデルが読み込まれると自動的に開始します。",
       saveHistory: "履歴を保存",
       saveHistoryDescription: "このブラウザにのみ保存されます。",
       showPrompt: "プロンプトを表示",
-      showPromptDescription: "モデルに送信される指示をそのまま確認できます。",
+      showPromptDescription: "モデルに送られる正確な指示を表示します。",
     },
     history: {
       title: "履歴",
@@ -5973,6 +5982,12 @@ export const ja = {
     maximize: "ウィンドウを最大化",
     restore: "ウィンドウを元のサイズに戻す",
     close: "ウィンドウを閉じる",
+    mediaCodecs: {
+      title: "生成した動画が再生されない場合があります",
+      // {command}: an apt command line, never translated.
+      description: "このシステムには GStreamer の動画デコーダーがありません。次のコマンドでインストールしてください: {command}",
+      copy: "コマンドをコピー",
+    },
   },
   runtimeUpdate: {
     installAudio: "オーディオランタイムをインストール",
@@ -6067,7 +6082,6 @@ export const ja = {
     back: "戻る",
     continue: "続ける",
     skipSetup: "セットアップをスキップ",
-    outsideAgain: "もう一度外側をクリックすると閉じます",
     getStarted: "はじめる",
     progress: "ステップ {current}/{total}",
     welcome: {

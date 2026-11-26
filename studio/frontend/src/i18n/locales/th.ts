@@ -933,10 +933,17 @@ export const th = {
   chatMenu: {
     more: "ตัวเลือกแชท",
     copy: "คัดลอก",
-    addScheduledTask: "เพิ่มงานตามกำหนดเวลา…",
+    addScheduledTask: "เพิ่มงานตามกำหนดเวลา",
     compact: "ย่อการสนทนา",
     compactEmpty: "ยังไม่มีอะไรให้ย่อ",
     compactUnsupported: "การย่อการสนทนาต้องใช้โมเดล GGUF หรือ MLX ที่รองรับเครื่องมือ",
+  },
+  chatFiles: {
+    title: "ไฟล์ในแชทนี้",
+    code: "ส่วนย่อยของโค้ด",
+    showInChat: "แสดงในแชท",
+    download: "ดาวน์โหลด {name}",
+    saveFailed: "ไม่สามารถบันทึก {name} ได้",
   },
   welcome: {
     goodToSeeYou: "ยินดีที่ได้พบคุณ",
@@ -1017,6 +1024,7 @@ export const th = {
     saving: "กำลังบันทึก...",
     search: "ค้นหา",
     shutdown: "ปิดระบบ",
+    technicalDetails: "รายละเอียดทางเทคนิค",
   },
   shell: {
     helpMenu: {
@@ -4244,8 +4252,8 @@ export const th = {
       summary: {
         single: "เทรนบน GPU เดียว",
         layerSplit: "โมเดลถูกแบ่งทีละเลเยอร์ไปยัง {count} GPU",
-        ddp: "โมเดลใส่ใน GPU เดียวได้: ขนานข้อมูลบน {count} GPU",
-        fsdp2: "โมเดลใหญ่เกินกว่า GPU เดียว: แบ่งส่วนไปยัง {count} GPU",
+        ddp: "แต่ละ GPU เทรนสำเนาเต็ม: ขนานข้อมูลบน {count} GPU",
+        fsdp2: "น้ำหนักและสถานะ optimizer แบ่งส่วนไปยัง {count} GPU",
         tp: "แต่ละเลเยอร์ถูกแบ่งไปยัง {count} GPU",
         pp: "เลเยอร์ทำงานเป็นไปป์ไลน์ {count} ขั้น ขั้นละหนึ่ง GPU",
         cp: "แต่ละลำดับถูกแบ่งไปยัง {count} GPU",
@@ -4256,7 +4264,7 @@ export const th = {
         noGpu: "เลือก GPU อย่างน้อยหนึ่งตัว",
         singleNeedsOne: "GPU เดียวใช้ GPU เพียงตัวเดียว ยกเลิกเลือกตัวอื่น",
         needsTwo: "โหมดนี้ต้องใช้ GPU อย่างน้อยสองตัว",
-        customSpec: "ใส่รูปแบบ เช่น dp=2,tp=2",
+        customSpec: "ใส่รูปแบบ เช่น {example}",
       },
     },
     preview: {
@@ -5145,6 +5153,7 @@ export const th = {
     model: {
       label: "โมเดลแปลภาษา",
       fast: "เร็ว",
+      balanced: "สมดุล",
       quality: "คุณภาพดีที่สุด",
       chat: "โมเดลแชท",
       recommended: "แนะนำ",
@@ -5166,11 +5175,11 @@ export const th = {
       toneFormal: "ทางการ",
       toneCasual: "เป็นกันเอง",
       auto: "แปลขณะพิมพ์",
-      autoDescription: "เริ่มเมื่อโหลดโมเดลแล้ว การพิมพ์จะไม่เริ่มการดาวน์โหลด",
+      autoDescription: "เริ่มอัตโนมัติเมื่อโหลดโมเดลแล้ว",
       saveHistory: "บันทึกประวัติ",
       saveHistoryDescription: "เก็บไว้ในเบราว์เซอร์นี้เท่านั้น",
       showPrompt: "แสดงพรอมต์",
-      showPromptDescription: "ดูคำสั่งที่ส่งให้โมเดลแบบคำต่อคำ",
+      showPromptDescription: "ดูคำสั่งที่ส่งไปยังโมเดลอย่างละเอียด",
     },
     history: {
       title: "ประวัติ",
@@ -6152,6 +6161,12 @@ export const th = {
     maximize: "ขยายหน้าต่างใหญ่สุด",
     restore: "คืนขนาดหน้าต่าง",
     close: "ปิดหน้าต่าง",
+    mediaCodecs: {
+      title: "วิดีโอที่สร้างอาจเล่นไม่ได้",
+      // {command}: an apt command line, never translated.
+      description: "ระบบนี้ไม่มีตัวถอดรหัสวิดีโอของ GStreamer ติดตั้งด้วยคำสั่ง: {command}",
+      copy: "คัดลอกคำสั่ง",
+    },
   },
   runtimeUpdate: {
     installAudio: "ติดตั้งรันไทม์เสียง",
@@ -6246,7 +6261,6 @@ export const th = {
     back: "ย้อนกลับ",
     continue: "ดำเนินการต่อ",
     skipSetup: "ข้ามการตั้งค่า",
-    outsideAgain: "คลิกด้านนอกอีกครั้งเพื่อปิด",
     getStarted: "เริ่มต้นใช้งาน",
     progress: "ขั้นตอนที่ {current} จาก {total}",
     welcome: {

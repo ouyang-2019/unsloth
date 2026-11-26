@@ -347,6 +347,17 @@ def _no_sdpa_align_wrapper_left_installed():
 
 
 @pytest.fixture(autouse = True)
+def _no_nvfp4_weight_quant_patch_left_installed():
+    # quantize_transformer installs it process-wide for an NVFP4 load. A test that drives the real quantize
+    # leaves torchao's NVFP4Tensor.to_nvfp4 rewritten to 4over6, so every later "torchao reference" in that
+    # worker is the patch itself and max6 parity fails against it.
+    yield
+    weight_quant = sys.modules.get("core.inference.diffusion_nvfp4_weight_quant")
+    if weight_quant is not None:
+        weight_quant.uninstall_nvfp4_weight_quant_patch()
+
+
+@pytest.fixture(autouse = True)
 def _forget_hub_unreachable_verdict():
     # Per-process Hub verdict must not leak between tests.
     def _forget():
@@ -455,6 +466,17 @@ def _restore_dynamo_process_knobs():
     for k, v in before.items():
         if getattr(cfg, k, v) != v:
             setattr(cfg, k, v)
+
+
+@pytest.fixture(autouse = True)
+def _uninstall_sdpa_align_wrapper():
+    # The DiT trainer's compile step wraps inductor's SDPA layout constraint and appends its cache_key_tag; only the
+    # full run's finally takes it out. A test that called the compile step alone left both on the xdist worker, and
+    # test_diffusion_cache_tag_contexts.py then read "|unsloth_sdpa_align=unguarded;..." for its own tags.
+    yield
+    align = sys.modules.get("core.training.diffusion_sdpa_align")
+    if align is not None and align.installed():
+        align.uninstall_sdpa_align_without_guard()
 
 
 @pytest.fixture(autouse = True)

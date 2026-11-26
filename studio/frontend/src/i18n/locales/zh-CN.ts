@@ -882,10 +882,17 @@ export const zhCN = {
   chatMenu: {
     more: "聊天选项",
     copy: "复制",
-    addScheduledTask: "添加定时任务…",
+    addScheduledTask: "添加定时任务",
     compact: "压缩对话",
     compactEmpty: "暂无可压缩的内容",
     compactUnsupported: "对话压缩需要支持工具调用的 GGUF 或 MLX 模型",
+  },
+  chatFiles: {
+    title: "此聊天中的文件",
+    code: "代码片段",
+    showInChat: "在聊天中显示",
+    download: "下载 {name}",
+    saveFailed: "无法保存 {name}。",
   },
   welcome: {
     goodToSeeYou: "很高兴见到你",
@@ -964,6 +971,7 @@ export const zhCN = {
     saving: "保存中...",
     search: "搜索",
     shutdown: "关闭服务",
+    technicalDetails: "技术详情",
   },
   shell: {
     helpMenu: {
@@ -4056,8 +4064,8 @@ export const zhCN = {
       summary: {
         single: "在一个 GPU 上训练",
         layerSplit: "模型按层拆分到 {count} 个 GPU 上",
-        ddp: "模型可放入单个 GPU：在 {count} 个 GPU 上进行数据并行",
-        fsdp2: "模型太大，单个 GPU 放不下：分片到 {count} 个 GPU 上",
+        ddp: "每个 GPU 训练一份完整副本：在 {count} 个 GPU 上进行数据并行",
+        fsdp2: "权重和优化器状态分片到 {count} 个 GPU 上",
         tp: "每一层都拆分到 {count} 个 GPU 上",
         pp: "各层组成 {count} 个流水线阶段，每个 GPU 一个",
         cp: "每个序列都拆分到 {count} 个 GPU 上",
@@ -4068,7 +4076,7 @@ export const zhCN = {
         noGpu: "请至少选择一个 GPU。",
         singleNeedsOne: "单 GPU 模式只使用一个 GPU，请取消勾选其他 GPU。",
         needsTwo: "此模式至少需要两个 GPU。",
-        customSpec: "请输入布局，例如 dp=2,tp=2。",
+        customSpec: "请输入布局，例如 {example}。",
       },
     },
     preview: {
@@ -4931,6 +4939,7 @@ export const zhCN = {
     model: {
       label: "翻译模型",
       fast: "快速",
+      balanced: "均衡",
       quality: "最佳质量",
       chat: "聊天模型",
       recommended: "推荐",
@@ -4952,11 +4961,11 @@ export const zhCN = {
       toneFormal: "正式",
       toneCasual: "随意",
       auto: "边输入边翻译",
-      autoDescription: "模型加载后开始。输入文字不会触发下载。",
+      autoDescription: "模型加载后自动开始。",
       saveHistory: "保存历史记录",
       saveHistoryDescription: "仅保存在此浏览器中。",
       showPrompt: "显示提示词",
-      showPromptDescription: "查看发送给模型的完整指令。",
+      showPromptDescription: "查看发送给模型的确切指令。",
     },
     history: {
       title: "历史记录",
@@ -5924,6 +5933,12 @@ export const zhCN = {
     maximize: "最大化窗口",
     restore: "还原窗口",
     close: "关闭窗口",
+    mediaCodecs: {
+      title: "生成的视频可能无法播放",
+      // {command}: an apt command line, never translated.
+      description: "此系统缺少 GStreamer 视频解码器。请使用以下命令安装：{command}",
+      copy: "复制命令",
+    },
   },
   runtimeUpdate: {
     installAudio: "安装音频运行时",
@@ -6018,7 +6033,6 @@ export const zhCN = {
     back: "返回",
     continue: "继续",
     skipSetup: "跳过设置",
-    outsideAgain: "再次点击外部即可关闭",
     getStarted: "开始使用",
     progress: "第 {current} 步，共 {total} 步",
     welcome: {

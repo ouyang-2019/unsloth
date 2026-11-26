@@ -989,11 +989,18 @@ export const nl = {
   chatMenu: {
     more: "Chatopties",
     copy: "Kopiëren",
-    addScheduledTask: "Geplande taak toevoegen…",
+    addScheduledTask: "Geplande taak toevoegen",
     compact: "Gesprek comprimeren",
     compactEmpty: "Nog niets om te comprimeren",
     compactUnsupported:
       "Comprimeren vereist een GGUF- of MLX-model met toolondersteuning",
+  },
+  chatFiles: {
+    title: "Bestanden in deze chat",
+    code: "Codefragmenten",
+    showInChat: "Tonen in chat",
+    download: "{name} downloaden",
+    saveFailed: "Kan {name} niet opslaan.",
   },
   welcome: {
     goodToSeeYou: "Fijn je te zien",
@@ -1080,6 +1087,7 @@ export const nl = {
     saving: "Opslaan...",
     search: "Zoeken",
     shutdown: "Afsluiten",
+    technicalDetails: "Technische details",
   },
   shell: {
     helpMenu: {
@@ -4465,8 +4473,8 @@ export const nl = {
       summary: {
         single: "Training op één GPU",
         layerSplit: "Model wordt laag voor laag over {count} GPU's verdeeld",
-        ddp: "Model past op één GPU: dataparallel op {count} GPU's",
-        fsdp2: "Model is te groot voor één GPU: geshard over {count} GPU's",
+        ddp: "Elke GPU traint een volledige kopie: dataparallel op {count} GPU's",
+        fsdp2: "Gewichten en optimizerstatus geshard over {count} GPU's",
         tp: "Elke laag wordt over {count} GPU's verdeeld",
         pp: "Lagen draaien als {count} pijplijnfasen, één per GPU",
         cp: "Elke reeks wordt over {count} GPU's verdeeld",
@@ -4477,7 +4485,7 @@ export const nl = {
         noGpu: "Selecteer minstens één GPU.",
         singleNeedsOne: "Eén GPU gebruikt precies één GPU. Vink de andere uit.",
         needsTwo: "Deze modus heeft minstens twee GPU's nodig.",
-        customSpec: "Voer een indeling in, bijvoorbeeld dp=2,tp=2.",
+        customSpec: "Voer een indeling in, bijvoorbeeld {example}.",
       },
     },
     preview: {
@@ -5421,6 +5429,7 @@ export const nl = {
     model: {
       label: "Vertaalmodel",
       fast: "Snel",
+      balanced: "Gebalanceerd",
       quality: "Beste kwaliteit",
       chat: "Chatmodel",
       recommended: "Aanbevolen",
@@ -5442,11 +5451,11 @@ export const nl = {
       toneFormal: "Formeel",
       toneCasual: "Informeel",
       auto: "Vertalen tijdens het typen",
-      autoDescription: "Begint zodra het model is geladen. Typen start nooit een download.",
+      autoDescription: "Start automatisch zodra het model is geladen.",
       saveHistory: "Geschiedenis opslaan",
       saveHistoryDescription: "Wordt alleen in deze browser bewaard.",
       showPrompt: "Prompt tonen",
-      showPromptDescription: "Bekijk de exacte instructies die naar het model worden gestuurd.",
+      showPromptDescription: "Bekijk de exacte instructies die naar het model gaan.",
     },
     history: {
       title: "Geschiedenis",
@@ -6488,6 +6497,12 @@ export const nl = {
     maximize: "Venster maximaliseren",
     restore: "Venster herstellen",
     close: "Venster sluiten",
+    mediaCodecs: {
+      title: "Gegenereerde video's worden mogelijk niet afgespeeld",
+      // {command}: an apt command line, never translated.
+      description: "Op dit systeem ontbreken de GStreamer-videodecoders. Installeer ze met: {command}",
+      copy: "Opdracht kopiëren",
+    },
   },
   runtimeUpdate: {
     installAudio: "De audioruntime installeren",
@@ -6584,7 +6599,6 @@ export const nl = {
     back: "Terug",
     continue: "Doorgaan",
     skipSetup: "Instellen overslaan",
-    outsideAgain: "Klik nogmaals buiten het venster om te sluiten",
     getStarted: "Aan de slag",
     progress: "Stap {current} van {total}",
     welcome: {

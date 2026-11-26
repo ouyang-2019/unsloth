@@ -985,11 +985,18 @@ export const es419 = {
   chatMenu: {
     more: "Opciones del chat",
     copy: "Copiar",
-    addScheduledTask: "Agregar tarea programada…",
+    addScheduledTask: "Agregar tarea programada",
     compact: "Compactar conversación",
     compactEmpty: "Aún no hay nada que compactar",
     compactUnsupported:
       "La compactación requiere un modelo GGUF o MLX compatible con herramientas",
+  },
+  chatFiles: {
+    title: "Archivos en este chat",
+    code: "Fragmentos de código",
+    showInChat: "Mostrar en el chat",
+    download: "Descargar {name}",
+    saveFailed: "No se pudo guardar {name}.",
   },
   welcome: {
     goodToSeeYou: "Me alegra verte",
@@ -1074,6 +1081,7 @@ export const es419 = {
     saving: "Guardando...",
     search: "Buscar",
     shutdown: "Apagar",
+    technicalDetails: "Detalles técnicos",
   },
   shell: {
     helpMenu: {
@@ -4483,8 +4491,8 @@ export const es419 = {
       summary: {
         single: "Entrenando en una GPU",
         layerSplit: "El modelo se divide capa por capa entre {count} GPU",
-        ddp: "El modelo cabe en una GPU: paralelismo de datos en {count} GPU",
-        fsdp2: "El modelo no cabe en una GPU: fragmentado entre {count} GPU",
+        ddp: "Cada GPU entrena una copia completa: paralelismo de datos en {count} GPU",
+        fsdp2: "Pesos y estado del optimizador fragmentados entre {count} GPU",
         tp: "Cada capa se divide entre {count} GPU",
         pp: "Las capas se ejecutan como {count} etapas de pipeline, una por GPU",
         cp: "Cada secuencia se divide entre {count} GPU",
@@ -4495,7 +4503,7 @@ export const es419 = {
         noGpu: "Selecciona al menos una GPU.",
         singleNeedsOne: "Una sola GPU usa exactamente una GPU. Desmarca las demás.",
         needsTwo: "Este modo necesita al menos dos GPU.",
-        customSpec: "Escribe una distribución, por ejemplo dp=2,tp=2.",
+        customSpec: "Escribe una distribución, por ejemplo {example}.",
       },
     },
     preview: {
@@ -5456,6 +5464,7 @@ export const es419 = {
     model: {
       label: "Modelo de traducción",
       fast: "Rápido",
+      balanced: "Equilibrado",
       quality: "Mejor calidad",
       chat: "Modelo de chat",
       recommended: "Recomendados",
@@ -6525,6 +6534,12 @@ export const es419 = {
     maximize: "Maximizar ventana",
     restore: "Restaurar ventana",
     close: "Cerrar ventana",
+    mediaCodecs: {
+      title: "Es posible que los videos generados no se reproduzcan",
+      // {command}: an apt command line, never translated.
+      description: "A este sistema le faltan los decodificadores de video de GStreamer. Instálalos con: {command}",
+      copy: "Copiar comando",
+    },
   },
   runtimeUpdate: {
     installAudio: "Instalar el runtime de audio",
@@ -6621,7 +6636,6 @@ export const es419 = {
     back: "Atrás",
     continue: "Continuar",
     skipSetup: "Omitir configuración",
-    outsideAgain: "Haz clic afuera otra vez para cerrar",
     getStarted: "Comenzar",
     progress: "Paso {current} de {total}",
     welcome: {

@@ -986,11 +986,18 @@ export const pl = {
   chatMenu: {
     more: "Opcje czatu",
     copy: "Kopiuj",
-    addScheduledTask: "Dodaj zaplanowane zadanie…",
+    addScheduledTask: "Dodaj zaplanowane zadanie",
     compact: "Kompaktuj rozmowę",
     compactEmpty: "Nie ma jeszcze czego kompaktować",
     compactUnsupported:
       "Kompaktowanie wymaga modelu GGUF lub MLX z obsługą narzędzi",
+  },
+  chatFiles: {
+    title: "Pliki w tym czacie",
+    code: "Fragmenty kodu",
+    showInChat: "Pokaż w czacie",
+    download: "Pobierz {name}",
+    saveFailed: "Nie udało się zapisać {name}.",
   },
   welcome: {
     goodToSeeYou: "Miło Cię widzieć",
@@ -1075,6 +1082,7 @@ export const pl = {
     saving: "Zapisywanie...",
     search: "Szukaj",
     shutdown: "Zamknij",
+    technicalDetails: "Szczegóły techniczne",
   },
   shell: {
     helpMenu: {
@@ -4466,8 +4474,8 @@ export const pl = {
       summary: {
         single: "Trenowanie na jednej karcie GPU",
         layerSplit: "Model jest dzielony warstwa po warstwie na karty GPU: {count}",
-        ddp: "Model mieści się na jednej karcie GPU: równoległość danych na kartach GPU: {count}",
-        fsdp2: "Model jest za duży na jedną kartę GPU: shardowany na karty GPU: {count}",
+        ddp: "Każda karta GPU trenuje pełną kopię: równoległość danych na kartach GPU: {count}",
+        fsdp2: "Wagi i stan optymalizatora shardowane na karty GPU: {count}",
         tp: "Każda warstwa jest dzielona na karty GPU: {count}",
         pp: "Warstwy działają jako etapy potoku ({count}), po jednym na kartę GPU",
         cp: "Każda sekwencja jest dzielona na karty GPU: {count}",
@@ -4478,7 +4486,7 @@ export const pl = {
         noGpu: "Wybierz co najmniej jedną kartę GPU.",
         singleNeedsOne: "Jedna karta GPU używa dokładnie jednej karty. Odznacz pozostałe.",
         needsTwo: "Ten tryb wymaga co najmniej dwóch kart GPU.",
-        customSpec: "Wpisz układ, na przykład dp=2,tp=2.",
+        customSpec: "Wpisz układ, na przykład {example}.",
       },
     },
     preview: {
@@ -5422,6 +5430,7 @@ export const pl = {
     model: {
       label: "Model tłumaczenia",
       fast: "Szybki",
+      balanced: "Zrównoważony",
       quality: "Najlepsza jakość",
       chat: "Model czatu",
       recommended: "Polecane",
@@ -5443,7 +5452,7 @@ export const pl = {
       toneFormal: "Formalny",
       toneCasual: "Swobodny",
       auto: "Tłumacz podczas pisania",
-      autoDescription: "Zaczyna działać po wczytaniu modelu. Pisanie nigdy nie rozpoczyna pobierania.",
+      autoDescription: "Uruchamia się automatycznie po załadowaniu modelu.",
       saveHistory: "Zapisuj historię",
       saveHistoryDescription: "Przechowywana tylko w tej przeglądarce.",
       showPrompt: "Pokaż prompt",
@@ -6483,6 +6492,12 @@ export const pl = {
     maximize: "Maksymalizuj okno",
     restore: "Przywróć okno",
     close: "Zamknij okno",
+    mediaCodecs: {
+      title: "Wygenerowane filmy mogą się nie odtwarzać",
+      // {command}: an apt command line, never translated.
+      description: "W tym systemie brakuje dekoderów wideo GStreamer. Zainstaluj je poleceniem: {command}",
+      copy: "Kopiuj polecenie",
+    },
   },
   runtimeUpdate: {
     installAudio: "Zainstaluj środowisko uruchomieniowe audio",
@@ -6578,7 +6593,6 @@ export const pl = {
     back: "Wstecz",
     continue: "Dalej",
     skipSetup: "Pomiń konfigurację",
-    outsideAgain: "Kliknij ponownie poza oknem, aby zamknąć",
     getStarted: "Zaczynajmy",
     progress: "Krok {current} z {total}",
     welcome: {

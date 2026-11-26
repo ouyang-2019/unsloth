@@ -929,10 +929,17 @@ export const zhTW = {
   chatMenu: {
     more: "聊天選項",
     copy: "複製",
-    addScheduledTask: "新增排程任務…",
+    addScheduledTask: "新增排程任務",
     compact: "壓縮對話",
     compactEmpty: "目前還沒有可壓縮的內容",
     compactUnsupported: "壓縮需要支援工具的 GGUF 或 MLX 模型",
+  },
+  chatFiles: {
+    title: "此聊天中的檔案",
+    code: "程式碼片段",
+    showInChat: "在聊天中顯示",
+    download: "下載 {name}",
+    saveFailed: "無法儲存 {name}。",
   },
   welcome: {
     goodToSeeYou: "很高興見到您",
@@ -1014,6 +1021,7 @@ export const zhTW = {
     saving: "儲存中...",
     search: "搜尋",
     shutdown: "關閉",
+    technicalDetails: "技術詳細資料",
   },
   shell: {
     helpMenu: {
@@ -4219,8 +4227,8 @@ export const zhTW = {
       summary: {
         single: "在一個 GPU 上訓練",
         layerSplit: "模型按層拆分到 {count} 個 GPU 上",
-        ddp: "模型可放入單一 GPU：在 {count} 個 GPU 上進行資料平行",
-        fsdp2: "模型太大，單一 GPU 放不下：分片到 {count} 個 GPU 上",
+        ddp: "每個 GPU 訓練一份完整副本：在 {count} 個 GPU 上進行資料平行",
+        fsdp2: "權重與最佳化器狀態分片到 {count} 個 GPU 上",
         tp: "每一層都拆分到 {count} 個 GPU 上",
         pp: "各層組成 {count} 個管線階段，每個 GPU 一個",
         cp: "每個序列都拆分到 {count} 個 GPU 上",
@@ -4231,7 +4239,7 @@ export const zhTW = {
         noGpu: "請至少選擇一個 GPU。",
         singleNeedsOne: "單一 GPU 模式只使用一個 GPU，請取消勾選其他 GPU。",
         needsTwo: "此模式至少需要兩個 GPU。",
-        customSpec: "請輸入配置，例如 dp=2,tp=2。",
+        customSpec: "請輸入配置，例如 {example}。",
       },
     },
     preview: {
@@ -5103,6 +5111,7 @@ export const zhTW = {
     model: {
       label: "翻譯模型",
       fast: "快速",
+      balanced: "均衡",
       quality: "最佳品質",
       chat: "聊天模型",
       recommended: "推薦",
@@ -5124,11 +5133,11 @@ export const zhTW = {
       toneFormal: "正式",
       toneCasual: "輕鬆",
       auto: "邊輸入邊翻譯",
-      autoDescription: "模型載入後開始。輸入文字不會觸發下載。",
+      autoDescription: "模型載入後自動開始。",
       saveHistory: "儲存記錄",
       saveHistoryDescription: "僅保存在這個瀏覽器中。",
       showPrompt: "顯示提示詞",
-      showPromptDescription: "查看傳送給模型的完整指示。",
+      showPromptDescription: "查看傳送給模型的確切指示。",
     },
     history: {
       title: "記錄",
@@ -6103,6 +6112,12 @@ export const zhTW = {
     maximize: "最大化視窗",
     restore: "還原視窗",
     close: "關閉視窗",
+    mediaCodecs: {
+      title: "產生的影片可能無法播放",
+      // {command}: an apt command line, never translated.
+      description: "此系統缺少 GStreamer 影片解碼器。請使用以下指令安裝：{command}",
+      copy: "複製指令",
+    },
   },
   runtimeUpdate: {
     installAudio: "安裝音訊執行環境",
@@ -6197,7 +6212,6 @@ export const zhTW = {
     back: "返回",
     continue: "繼續",
     skipSetup: "略過設定",
-    outsideAgain: "再次點擊外部即可關閉",
     getStarted: "開始使用",
     progress: "第 {current} 步，共 {total} 步",
     welcome: {

@@ -985,11 +985,18 @@ export const uk = {
   chatMenu: {
     more: "Параметри чату",
     copy: "Копіювати",
-    addScheduledTask: "Додати заплановане завдання…",
+    addScheduledTask: "Додати заплановане завдання",
     compact: "Стиснути розмову",
     compactEmpty: "Поки що нічого стискати",
     compactUnsupported:
       "Для стиснення потрібна модель GGUF або MLX з підтримкою інструментів",
+  },
+  chatFiles: {
+    title: "Файли в цьому чаті",
+    code: "Фрагменти коду",
+    showInChat: "Показати в чаті",
+    download: "Завантажити {name}",
+    saveFailed: "Не вдалося зберегти {name}.",
   },
   welcome: {
     goodToSeeYou: "Радий вас бачити",
@@ -1075,6 +1082,7 @@ export const uk = {
     saving: "Збереження...",
     search: "Пошук",
     shutdown: "Вимкнути",
+    technicalDetails: "Технічні відомості",
   },
   shell: {
     helpMenu: {
@@ -4451,8 +4459,8 @@ export const uk = {
       summary: {
         single: "Навчання на одному GPU",
         layerSplit: "Модель поділено за шарами між GPU: {count}",
-        ddp: "Модель вміщується в один GPU: паралелізм даних на GPU: {count}",
-        fsdp2: "Модель завелика для одного GPU: шардовано між GPU: {count}",
+        ddp: "Кожен GPU тренує повну копію: паралелізм даних на GPU: {count}",
+        fsdp2: "Ваги та стан оптимізатора шардовано між GPU: {count}",
         tp: "Кожен шар поділено між GPU: {count}",
         pp: "Шари працюють як етапи конвеєра ({count}), по одному на GPU",
         cp: "Кожну послідовність поділено між GPU: {count}",
@@ -4463,7 +4471,7 @@ export const uk = {
         noGpu: "Виберіть принаймні один GPU.",
         singleNeedsOne: "Режим «Один GPU» використовує рівно один GPU. Зніміть позначки з інших.",
         needsTwo: "Для цього режиму потрібно щонайменше два GPU.",
-        customSpec: "Введіть схему, наприклад dp=2,tp=2.",
+        customSpec: "Введіть схему, наприклад {example}.",
       },
     },
     preview: {
@@ -5412,6 +5420,7 @@ export const uk = {
     model: {
       label: "Модель перекладу",
       fast: "Швидка",
+      balanced: "Збалансована",
       quality: "Найкраща якість",
       chat: "Модель чату",
       recommended: "Рекомендовані",
@@ -5433,11 +5442,11 @@ export const uk = {
       toneFormal: "Офіційний",
       toneCasual: "Невимушений",
       auto: "Перекладати під час введення",
-      autoDescription: "Починається, щойно модель завантажено. Введення тексту ніколи не запускає завантаження.",
+      autoDescription: "Запускається автоматично, коли модель завантажено.",
       saveHistory: "Зберігати історію",
       saveHistoryDescription: "Зберігається лише в цьому браузері.",
       showPrompt: "Показувати промпт",
-      showPromptDescription: "Перегляньте точні інструкції, надіслані моделі.",
+      showPromptDescription: "Переглянути точні інструкції, надіслані моделі.",
     },
     history: {
       title: "Історія",
@@ -6474,6 +6483,12 @@ export const uk = {
     maximize: "Розгорнути вікно",
     restore: "Відновити вікно",
     close: "Закрити вікно",
+    mediaCodecs: {
+      title: "Створені відео можуть не відтворюватися",
+      // {command}: an apt command line, never translated.
+      description: "У системі бракує відеодекодерів GStreamer. Установіть їх командою: {command}",
+      copy: "Копіювати команду",
+    },
   },
   runtimeUpdate: {
     installAudio: "Інсталювати аудіосередовище виконання",
@@ -6570,7 +6585,6 @@ export const uk = {
     back: "Назад",
     continue: "Далі",
     skipSetup: "Пропустити налаштування",
-    outsideAgain: "Клацніть ззовні ще раз, щоб закрити",
     getStarted: "Почати",
     progress: "Крок {current} з {total}",
     welcome: {

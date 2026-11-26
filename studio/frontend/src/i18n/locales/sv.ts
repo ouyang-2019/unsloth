@@ -935,10 +935,17 @@ export const sv = {
   chatMenu: {
     more: "Chattalternativ",
     copy: "Kopiera",
-    addScheduledTask: "Lägg till schemalagd uppgift…",
+    addScheduledTask: "Lägg till schemalagd uppgift",
     compact: "Komprimera konversationen",
     compactEmpty: "Inget att komprimera än",
     compactUnsupported: "Komprimering kräver en GGUF- eller MLX-modell med verktygsstöd",
+  },
+  chatFiles: {
+    title: "Filer i den här chatten",
+    code: "Kodavsnitt",
+    showInChat: "Visa i chatten",
+    download: "Ladda ned {name}",
+    saveFailed: "Det gick inte att spara {name}.",
   },
   welcome: {
     goodToSeeYou: "Kul att se dig",
@@ -1020,6 +1027,7 @@ export const sv = {
     saving: "Sparar …",
     search: "Sök",
     shutdown: "Stäng av",
+    technicalDetails: "Tekniska detaljer",
   },
   shell: {
     helpMenu: {
@@ -4307,8 +4315,8 @@ export const sv = {
       summary: {
         single: "Tränar på en GPU",
         layerSplit: "Modellen delas lager för lager över {count} GPU:er",
-        ddp: "Modellen får plats på en GPU: dataparallell på {count} GPU:er",
-        fsdp2: "Modellen är för stor för en GPU: shardad över {count} GPU:er",
+        ddp: "Varje GPU tränar en fullständig kopia: dataparallell på {count} GPU:er",
+        fsdp2: "Vikter och optimerartillstånd shardade över {count} GPU:er",
         tp: "Varje lager delas över {count} GPU:er",
         pp: "Lagren körs som {count} pipelinesteg, ett per GPU",
         cp: "Varje sekvens delas över {count} GPU:er",
@@ -4319,7 +4327,7 @@ export const sv = {
         noGpu: "Välj minst en GPU.",
         singleNeedsOne: "En GPU använder exakt en GPU. Avmarkera de andra.",
         needsTwo: "Det här läget kräver minst två GPU:er.",
-        customSpec: "Ange en layout, till exempel dp=2,tp=2.",
+        customSpec: "Ange en layout, till exempel {example}.",
       },
     },
     preview: {
@@ -5246,6 +5254,7 @@ export const sv = {
     model: {
       label: "Översättningsmodell",
       fast: "Snabb",
+      balanced: "Balanserad",
       quality: "Bäst kvalitet",
       chat: "Chattmodell",
       recommended: "Rekommenderade",
@@ -5267,11 +5276,11 @@ export const sv = {
       toneFormal: "Formell",
       toneCasual: "Ledig",
       auto: "Översätt medan du skriver",
-      autoDescription: "Startar när modellen är inläst. Att skriva startar aldrig en hämtning.",
+      autoDescription: "Startar automatiskt när modellen har laddats.",
       saveHistory: "Spara historik",
       saveHistoryDescription: "Sparas bara i den här webbläsaren.",
       showPrompt: "Visa prompt",
-      showPromptDescription: "Se de exakta instruktionerna som skickas till modellen.",
+      showPromptDescription: "Se exakta instruktioner som skickas till modellen.",
     },
     history: {
       title: "Historik",
@@ -6267,6 +6276,12 @@ export const sv = {
     maximize: "Maximera fönstret",
     restore: "Återställ fönstret",
     close: "Stäng fönstret",
+    mediaCodecs: {
+      title: "Genererade videor kanske inte spelas upp",
+      // {command}: an apt command line, never translated.
+      description: "Systemet saknar GStreamers videoavkodare. Installera dem med: {command}",
+      copy: "Kopiera kommando",
+    },
   },
   runtimeUpdate: {
     installAudio: "Installera ljudkörmiljön",
@@ -6361,7 +6376,6 @@ export const sv = {
     back: "Tillbaka",
     continue: "Fortsätt",
     skipSetup: "Hoppa över konfigurering",
-    outsideAgain: "Klicka utanför igen för att stänga",
     getStarted: "Kom igång",
     progress: "Steg {current} av {total}",
     welcome: {

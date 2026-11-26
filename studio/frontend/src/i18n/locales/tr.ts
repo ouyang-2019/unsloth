@@ -974,11 +974,18 @@ export const tr = {
   chatMenu: {
     more: "Sohbet seçenekleri",
     copy: "Kopyala",
-    addScheduledTask: "Zamanlanmış görev ekle…",
+    addScheduledTask: "Zamanlanmış görev ekle",
     compact: "Konuşmayı sıkıştır",
     compactEmpty: "Henüz sıkıştırılacak bir şey yok",
     compactUnsupported:
       "Sıkıştırma için araç desteği olan bir GGUF veya MLX modeli gerekir",
+  },
+  chatFiles: {
+    title: "Bu sohbetteki dosyalar",
+    code: "Kod parçacıkları",
+    showInChat: "Sohbette göster",
+    download: "{name} dosyasını indir",
+    saveFailed: "{name} kaydedilemedi.",
   },
   welcome: {
     goodToSeeYou: "Sizi görmek güzel",
@@ -1064,6 +1071,7 @@ export const tr = {
     saving: "Kaydediliyor...",
     search: "Ara",
     shutdown: "Kapat",
+    technicalDetails: "Teknik ayrıntılar",
   },
   shell: {
     helpMenu: {
@@ -4416,8 +4424,8 @@ export const tr = {
       summary: {
         single: "Tek GPU'da eğitim",
         layerSplit: "Model katman katman {count} GPU'ya bölünür",
-        ddp: "Model tek GPU'ya sığıyor: {count} GPU'da veri paralelliği",
-        fsdp2: "Model tek GPU için fazla büyük: {count} GPU'ya parçalanır",
+        ddp: "Her GPU tam bir kopya eğitir: {count} GPU'da veri paralelliği",
+        fsdp2: "Ağırlıklar ve optimizer durumu {count} GPU'ya parçalanır",
         tp: "Her katman {count} GPU'ya bölünür",
         pp: "Katmanlar, GPU başına bir tane olmak üzere {count} ardışık düzen aşaması olarak çalışır",
         cp: "Her dizi {count} GPU'ya bölünür",
@@ -4428,7 +4436,7 @@ export const tr = {
         noGpu: "En az bir GPU seçin.",
         singleNeedsOne: "Tek GPU tam olarak bir GPU kullanır. Diğerlerinin işaretini kaldırın.",
         needsTwo: "Bu mod en az iki GPU gerektirir.",
-        customSpec: "Bir düzen girin, örneğin dp=2,tp=2.",
+        customSpec: "Bir düzen girin, örneğin {example}.",
       },
     },
     preview: {
@@ -5371,6 +5379,7 @@ export const tr = {
     model: {
       label: "Çeviri modeli",
       fast: "Hızlı",
+      balanced: "Dengeli",
       quality: "En iyi kalite",
       chat: "Sohbet modeli",
       recommended: "Önerilen",
@@ -5392,11 +5401,11 @@ export const tr = {
       toneFormal: "Resmi",
       toneCasual: "Samimi",
       auto: "Yazarken çevir",
-      autoDescription: "Model yüklendikten sonra başlar. Yazmak hiçbir zaman indirme başlatmaz.",
+      autoDescription: "Model yüklendiğinde otomatik olarak başlar.",
       saveHistory: "Geçmişi kaydet",
       saveHistoryDescription: "Yalnızca bu tarayıcıda saklanır.",
       showPrompt: "İstemi göster",
-      showPromptDescription: "Modele gönderilen talimatları aynen görün.",
+      showPromptDescription: "Modele gönderilen talimatların tam halini görün.",
     },
     history: {
       title: "Geçmiş",
@@ -6426,6 +6435,12 @@ export const tr = {
     maximize: "Pencereyi ekranı kaplayacak şekilde büyüt",
     restore: "Pencereyi geri yükle",
     close: "Pencereyi kapat",
+    mediaCodecs: {
+      title: "Oluşturulan videolar oynatılamayabilir",
+      // {command}: an apt command line, never translated.
+      description: "Bu sistemde GStreamer video kod çözücüleri eksik. Şu komutla yükleyin: {command}",
+      copy: "Komutu kopyala",
+    },
   },
   runtimeUpdate: {
     installAudio: "Ses çalışma zamanını kur",
@@ -6522,7 +6537,6 @@ export const tr = {
     back: "Geri",
     continue: "Devam",
     skipSetup: "Kurulumu atla",
-    outsideAgain: "Kapatmak için dışarıya tekrar tıklayın",
     getStarted: "Başlayın",
     progress: "Adım {current} / {total}",
     welcome: {

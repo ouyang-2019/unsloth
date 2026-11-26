@@ -30,6 +30,7 @@ from .pp_schedules import (
     compiled_blocks,
     non_reentrant_checkpointing_only,
     split_backward_keeps_function_nodes,
+    split_backward_scope,
     single_backward_kernels,
     resolve_stages_per_rank,
     schedule_spec,
@@ -243,23 +244,36 @@ def pipeline_stage_of(model):
 
 
 @functools.lru_cache(maxsize = None)
-def _forward_only_stage_class():
-    """A PipelineStage for forward-only steps (has_backward False): the in-place gradient hand-over between two
-    adjacent stages on one rank (V schedules) is a no-op, as every backward action already is there."""
+def _adjacent_stage_class(forward_only):
+    """A PipelineStage for two adjacent stages on one rank (V schedules, loop schedules at pp 1).
+    torch < 2.12 (no PipelineStage._is_same_rank) warms up with a send / recv to the neighbour stages' rank even
+    when it is this rank; gloo has no pair to itself ("Pair is not connected", 0xC0000005 on Windows), so those
+    are dropped (local stages hand over in process). forward_only: the in-place gradient hand-over is a no-op."""
     from torch.distributed.pipelining import PipelineStage
 
-    class _ForwardOnlyStage(PipelineStage):
-        def get_local_bwd_output(self, mb_index):
-            if not self.has_backward:
-                return ()
-            return super().get_local_bwd_output(mb_index)
+    class _AdjacentStage(PipelineStage):
+        if not hasattr(PipelineStage, "_is_same_rank"):
 
-        def set_local_bwd_input(self, next_stage_bwd_outputs, mb_index):
-            if not self.has_backward:
-                return None
-            return super().set_local_bwd_input(next_stage_bwd_outputs, mb_index)
+            def _get_init_p2p_neighbors_ops(self):
+                return [
+                    op
+                    for op in super()._get_init_p2p_neighbors_ops()
+                    if getattr(op, "group_peer", None) != self.group_rank
+                ]
 
-    return _ForwardOnlyStage
+        if forward_only:
+
+            def get_local_bwd_output(self, mb_index):
+                if not self.has_backward:
+                    return ()
+                return super().get_local_bwd_output(mb_index)
+
+            def set_local_bwd_input(self, next_stage_bwd_outputs, mb_index):
+                if not self.has_backward:
+                    return None
+                return super().set_local_bwd_input(next_stage_bwd_outputs, mb_index)
+
+    return _AdjacentStage
 
 
 # ------------------------------------------------------------------------------- composed meshes
@@ -864,7 +878,11 @@ def _router_statistics(
         weights = torch.nn.functional.softmax(gate.to(device), dim = -1)
         _, selected = torch.topk(weights, top_k, dim = -1)
         if flat is None:
-            counts = counts + torch.bincount(selected.reshape(-1), minlength = num_experts).float()
+            # bincount syncs the host to size its output; float32 sums of ones are exact below 2**24.
+            index = selected.reshape(-1)
+            counts = counts + torch.zeros(
+                num_experts, dtype = torch.float32, device = device
+            ).scatter_add_(0, index, torch.ones_like(index, dtype = torch.float32))
             probs = probs + weights.float().sum(dim = 0)
             rows = rows + weights.shape[0]
         else:
@@ -883,14 +901,22 @@ def _router_statistics(
 
 def _load_balancing_from_statistics(stats, num_experts):
     counts, probs, rows = stats[:num_experts], stats[num_experts : 2 * num_experts], stats[-1]
+    # An all-masked micro-batch has no routed rows (counts and probs are 0 too): 0, not 0 / 0 = NaN.
+    rows = rows.clamp_min(1)
     return torch.sum((counts / rows) * (probs / rows)) * num_experts
 
 
-def _statistics_match_transformers(module, num_experts, top_k):
+def _statistics_match_transformers(
+    module,
+    num_experts,
+    top_k,
+    reference = None,
+):
     """The family's own load_balancing_loss_func equals the loss formed from per-stage statistics on random
     router logits (with and without a padding mask): a transformers change to the formula refuses instead of
-    training on a different loss."""
-    reference = getattr(sys.modules.get(module), "load_balancing_loss_func", None)
+    training on a different loss. `reference` checks that function instead of the module's."""
+    if reference is None:
+        reference = getattr(sys.modules.get(module), "load_balancing_loss_func", None)
     if not callable(reference):
         return False
     g = torch.Generator().manual_seed(0)
@@ -2227,6 +2253,12 @@ def _batch_kwargs(kwargs, bsz, device, what):
     return out
 
 
+def _restore_grads(kept):
+    """Add gradients set aside by PipelineParallel._take_fsdp_grads back onto the step's own."""
+    for p, grad in kept:
+        p.grad = grad if p.grad is None else p.grad + grad
+
+
 class PipelineParallel:
     """This rank's pipeline stage of a model split by apply_pipeline_parallel."""
 
@@ -2256,6 +2288,8 @@ class PipelineParallel:
         )  # this rank's pp index (its stage with one stage per rank)
         self.bounds = bounds  # [start, end) decoder layers of every stage (pp x stages_per_rank)
         self.spec = schedule_spec(schedule)
+        # A split (zero bubble) backward: each step runs with donated buffers off (split_backward_scope).
+        self.split_backward = False
         self.stages_per_rank = int(stages_per_rank)
         self.total_stages = self.num_stages * self.stages_per_rank
         if len(bounds) != self.total_stages:
@@ -2472,10 +2506,9 @@ class PipelineParallel:
                 (mb, seq, width), dtype = self.activation_dtype, device = "meta", requires_grad = True
             )
 
-        # eval_loss with two adjacent stages on this rank (V schedules, loop schedules at pp 1): they hand over
-        # their gradients in place, which a forward-only step has none of (torch asserts there).
+        # Adjacent stages on this rank (V schedules, loop schedules at pp 1): see _adjacent_stage_class.
         adjacent = any(k + 1 in self.local_stages for k in self.local_stages)
-        stage_cls = _forward_only_stage_class() if not train and adjacent else PipelineStage
+        stage_cls = _adjacent_stage_class(not train) if adjacent else PipelineStage
         for index, module in zip(self.local_stages, self.stage_modules):
             if index == 0:
                 example_in = torch.empty((mb, seq), dtype = torch.long, device = "meta")
@@ -2630,6 +2663,7 @@ class PipelineParallel:
         num_items_in_batch = max(num_items_in_batch, 1)
         # FSDP2 / DDP-style dp average the gradients over dp: dp x (this replica's token loss sum / global tokens).
         self._loss_multiplier = (dp_mesh.size() if dp_mesh is not None else 1) * float(loss_scale)
+        fresh = (bsz // m, seq, m, True) not in self._shapes
         schedule = self._schedule_for(bsz // m, seq, m)
         step_kwargs = _batch_kwargs(kwargs, bsz, device, "step")
         step_kwargs["labels"] = labels.to(device)
@@ -2648,17 +2682,32 @@ class PipelineParallel:
         args = (input_ids.to(device),) if self.is_first else ()
         target = step_kwargs["labels"] if self.is_last else None
         tables = self._size_frozen_table_memo(m)
+        # torch >= 2.12 sets every FSDP2 parameter's grad to None when a schedule runs its first step
+        # (_post_metadata_inference_cleanup): a new shape mid accumulation window would drop the earlier
+        # steps' gradients. Keep them aside and add them back.
+        kept = self._take_fsdp_grads() if fresh and self.dp_mesh is not None else None
         try:
-            schedule.step(*args, target = target, return_outputs = False, **step_kwargs)
+            with split_backward_scope(getattr(self, "split_backward", False)):
+                schedule.step(*args, target = target, return_outputs = False, **step_kwargs)
         finally:
             self._scaler = None
             self.ctx.num_items_in_batch = None
+            if kept:
+                _restore_grads(kept)
         if tables is not None:
             self.last_table_memo = tables.frozen_table_step_stats()
         if self.dp_mesh is not None:
             self._average_replicated_grads()
         total = self._batch_loss(m, device, dp_group)
         return total * float(loss_scale) if loss_scale != 1 else total
+
+    def _take_fsdp_grads(self):
+        kept = []
+        for p in self.module.parameters():
+            if p.grad is not None:
+                kept.append((p, p.grad))
+                p.grad = None
+        return kept
 
     def step_schedule(self, m):
         """The schedule a training step with `m` micro-batches runs: the default 1F1B (schedule_auto) falls back
@@ -2833,7 +2882,7 @@ class PipelineParallel:
         divided by the ranks holding a copy of it, summed over every rank)."""
         import torch.distributed as dist
 
-        from .tp_native import _square_sum
+        from .tp_native import _scale_tensors_, _square_sum
 
         self._check_unscaled()
         params = self.parameters() if parameters is None else list(parameters)
@@ -2853,9 +2902,7 @@ class PipelineParallel:
         elif self.num_stages > 1:
             dist.all_reduce(sq, group = self.group)
         total = sq.sqrt()
-        coef = torch.clamp(float(max_norm) / (total + eps), max = 1.0)
-        for g in grads:
-            g.mul_(coef.to(g.dtype))
+        _scale_tensors_(grads, total, float(max_norm), eps)
         return total.float()
 
     def unscale_(self, scaler, optimizer):
@@ -2992,7 +3039,7 @@ class PipelineParallel:
                     save_embedding_layers = kwargs.get("save_embedding_layers", "auto"),
                 )
                 local[adapter] = {
-                    k: (gather(v) if gather is not None else v).detach().cpu().clone()
+                    k: (gather(v) if gather is not None else v).detach().to("cpu", copy = True)
                     for k, v in selected.items()
                     if not k.startswith(self._foreign_prefixes)
                 }
@@ -3032,37 +3079,45 @@ class PipelineParallel:
             dist.all_gather_object(parts, tables, group = self.group)
             tables = provenance.merge_provenance(parts)
         merged = self.adapter_state_dict(**kwargs)
-        if merged is not None:
-            import peft.peft_model as peft_model
 
-            selection = peft_model.get_peft_model_state_dict
+        def write():
+            if merged is not None:
+                import peft.peft_model as peft_model
 
-            def gathered(
-                model,
-                state_dict = None,
-                adapter_name = "default",
-                **unused,
-            ):
-                return merged[adapter_name]
+                selection = peft_model.get_peft_model_state_dict
 
-            kwargs.pop("state_dict", None)
-            kwargs.setdefault("is_main_process", True)
-            # PEFT's own writer (files, config, card), fed the merged selection of every stage.
-            peft_model.get_peft_model_state_dict = gathered
-            try:
-                peft_model.PeftModel.save_pretrained(self.model, save_directory, **kwargs)
-            finally:
-                peft_model.get_peft_model_state_dict = selection
-            if kwargs.get("is_main_process", True):
-                # Every stage's tables, next to each adapter PEFT wrote ("default" here, others in <name>/),
-                # replacing the writer stage's own record that PEFT's save wrote there.
-                provenance.write_adapter_provenance(
-                    self.model, save_directory, tables, kwargs.get("selected_adapters")
-                )
+                def gathered(
+                    model,
+                    state_dict = None,
+                    adapter_name = "default",
+                    **unused,
+                ):
+                    return merged[adapter_name]
+
+                kwargs.pop("state_dict", None)
+                kwargs.setdefault("is_main_process", True)
+                # PEFT's own writer (files, config, card), fed the merged selection of every stage.
+                peft_model.get_peft_model_state_dict = gathered
+                try:
+                    peft_model.PeftModel.save_pretrained(self.model, save_directory, **kwargs)
+                finally:
+                    peft_model.get_peft_model_state_dict = selection
+                if kwargs.get("is_main_process", True):
+                    # Every stage's tables, next to each adapter PEFT wrote ("default" here, others in <name>/),
+                    # replacing the writer stage's own record that PEFT's save wrote there.
+                    provenance.write_adapter_provenance(
+                        self.model, save_directory, tables, kwargs.get("selected_adapters")
+                    )
+
         if self.composed:
-            dist.barrier()
+            group = None
         elif self.num_stages > 1:
-            dist.barrier(group = self.group)
+            group = self.group
+        else:
+            return write()
+        from .tp_native import _agree_write
+
+        _agree_write(write, group)
 
 
 def _default_activation_dtype(model, parts):
@@ -3165,6 +3220,14 @@ def apply_pipeline_parallel(
         existing = existing or level.__dict__.get("_unsloth_pp_stage")
     if existing is not None:
         return existing
+    if any(
+        level.__dict__.get("_unsloth_ep") is not None
+        for level in (_model_chain(model) if isinstance(model, nn.Module) else ())
+    ):
+        raise NotImplementedError(
+            "Unsloth: apply_pipeline_parallel cannot split an expert parallel model (apply_expert_parallel): its "
+            "experts are already split by index over the ranks. ep with pipeline parallel is not supported."
+        )
     _check_torch_pipelining()
     config = config or PPConfig()
     spec = schedule_spec(schedule)
@@ -3273,6 +3336,7 @@ def apply_pipeline_parallel(
         carry = carry,
         carry_at = carry_at,
     )
+    pp_stage.split_backward = bool(props["split_backward"])
     if pp > 1 and dtype != parts.embed.weight.dtype:
         pp_stage.ctx.wire_dtypes = _WireDtypes(pp_stage._global_ranks)
     stage_fn = getattr(type(parts.decoder), "pipeline_stage_forward", None)
@@ -3421,8 +3485,8 @@ def apply_pipeline_parallel(
                 else ""
             )
             + (
-                "; compiled backward graphs built without donated buffers (zero bubble runs autograd.grad "
-                "with retain_graph)"
+                "; compiled backward graphs built without donated buffers inside each step (zero bubble runs "
+                "autograd.grad with retain_graph)"
                 if donated_off
                 else ""
             )

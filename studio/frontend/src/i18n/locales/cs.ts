@@ -980,11 +980,18 @@ export const cs = {
   chatMenu: {
     more: "Možnosti chatu",
     copy: "Kopírovat",
-    addScheduledTask: "Přidat naplánovanou úlohu…",
+    addScheduledTask: "Přidat naplánovanou úlohu",
     compact: "Zkomprimovat konverzaci",
     compactEmpty: "Zatím není co komprimovat",
     compactUnsupported:
       "Komprimace vyžaduje model GGUF nebo MLX s podporou nástrojů",
+  },
+  chatFiles: {
+    title: "Soubory v tomto chatu",
+    code: "Úryvky kódu",
+    showInChat: "Zobrazit v chatu",
+    download: "Stáhnout {name}",
+    saveFailed: "{name} se nepodařilo uložit.",
   },
   welcome: {
     goodToSeeYou: "Je fajn vás vidět",
@@ -1069,6 +1076,7 @@ export const cs = {
     saving: "Ukládání...",
     search: "Hledat",
     shutdown: "Vypnout",
+    technicalDetails: "Technické podrobnosti",
   },
   shell: {
     helpMenu: {
@@ -4435,8 +4443,8 @@ export const cs = {
       summary: {
         single: "Trénování na jedné GPU",
         layerSplit: "Model je rozdělen po vrstvách na GPU: {count}",
-        ddp: "Model se vejde na jednu GPU: datový paralelismus na GPU: {count}",
-        fsdp2: "Model je na jednu GPU příliš velký: shardován na GPU: {count}",
+        ddp: "Každá GPU trénuje úplnou kopii: datový paralelismus na GPU: {count}",
+        fsdp2: "Váhy a stav optimalizátoru shardovány na GPU: {count}",
         tp: "Každá vrstva je rozdělena na GPU: {count}",
         pp: "Vrstvy běží jako fáze pipeline ({count}), jedna na GPU",
         cp: "Každá sekvence je rozdělena na GPU: {count}",
@@ -4447,7 +4455,7 @@ export const cs = {
         noGpu: "Vyberte alespoň jednu GPU.",
         singleNeedsOne: "Jedna GPU používá právě jednu GPU. Zrušte zaškrtnutí ostatních.",
         needsTwo: "Tento režim potřebuje alespoň dvě GPU.",
-        customSpec: "Zadejte rozvržení, například dp=2,tp=2.",
+        customSpec: "Zadejte rozvržení, například {example}.",
       },
     },
     preview: {
@@ -5391,6 +5399,7 @@ export const cs = {
     model: {
       label: "Překladový model",
       fast: "Rychlý",
+      balanced: "Vyvážený",
       quality: "Nejlepší kvalita",
       chat: "Model z chatu",
       recommended: "Doporučené",
@@ -5412,12 +5421,11 @@ export const cs = {
       toneFormal: "Formální",
       toneCasual: "Neformální",
       auto: "Překládat při psaní",
-      autoDescription:
-        "Spustí se po načtení modelu. Psaní nikdy nespustí stahování.",
+      autoDescription: "Spustí se automaticky po načtení modelu.",
       saveHistory: "Ukládat historii",
       saveHistoryDescription: "Ukládá se pouze v tomto prohlížeči.",
       showPrompt: "Zobrazit prompt",
-      showPromptDescription: "Zobrazí přesné pokyny odeslané modelu.",
+      showPromptDescription: "Zobrazit přesné pokyny odeslané modelu.",
     },
     history: {
       title: "Historie",
@@ -6453,6 +6461,12 @@ export const cs = {
     maximize: "Maximalizovat okno",
     restore: "Obnovit okno",
     close: "Zavřít okno",
+    mediaCodecs: {
+      title: "Vygenerovaná videa se nemusí přehrát",
+      // {command}: an apt command line, never translated.
+      description: "V systému chybí videodekodéry GStreamer. Nainstalujte je příkazem: {command}",
+      copy: "Kopírovat příkaz",
+    },
   },
   runtimeUpdate: {
     installAudio: "Nainstalovat zvukové běhové prostředí",
@@ -6547,7 +6561,6 @@ export const cs = {
     back: "Zpět",
     continue: "Pokračovat",
     skipSetup: "Přeskočit nastavení",
-    outsideAgain: "Kliknutím mimo okno jej znovu zavřete",
     getStarted: "Začít",
     progress: "Krok {current} z {total}",
     welcome: {

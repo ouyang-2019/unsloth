@@ -13,6 +13,7 @@ from collections import deque
 from typing import Annotated, Any, Dict, Literal, Optional, List, Union
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Discriminator,
@@ -1840,6 +1841,11 @@ class _InferenceRuntimeFields(BaseModel):
     )
     audio_server_task: Optional[str] = Field(
         None, description = "audio.cpp server task the running server was started with."
+    )
+    audio_separation: Optional[Dict[str, Any]] = Field(
+        None,
+        description = "What the model does on Separate: goal (stems, speakers, voice, restore) "
+        "and the id of its one output when it filters a recording; None when it does not separate.",
     )
     audio_convert: Optional[Dict[str, Any]] = Field(
         None, description = "What the model offers on Convert; None when it does not convert."
@@ -5528,6 +5534,12 @@ class DiffusionDetailerSpec(BaseModel):
     )
 
 
+# -1 = random (A1111, sd.cpp). le = 2**53-1: seeds round-trip through JSON recipes, where JavaScript rounds larger integers.
+MediaSeed = Annotated[
+    Optional[int], Field(ge = -1, le = 2**53 - 1), AfterValidator(lambda v: None if v == -1 else v)
+]
+
+
 class DiffusionGenerateRequest(BaseModel):
     """Request to generate one image from the loaded diffusion model."""
 
@@ -5560,10 +5572,7 @@ class DiffusionGenerateRequest(BaseModel):
         le = 20.0,
         description = "Classifier-free guidance scale. Omitted: the loaded model's default.",
     )
-    # le = 2**53-1: seeds round-trip through JSON recipes, where JavaScript rounds larger integers and a restored recipe would differ.
-    seed: Optional[int] = Field(
-        None, ge = 0, le = 2**53 - 1, description = "Seed for reproducibility (random if omitted)"
-    )
+    seed: MediaSeed = Field(None, description = "Seed for reproducibility (random if omitted or -1)")
     batch_size: int = Field(
         1, ge = 1, le = 32, description = "Images generated in one forward pass (VRAM-heavy)"
     )
@@ -6491,6 +6500,12 @@ class DiffusionStatusResponse(BaseModel):
         "denoiser calls (whole-step, per block, per-card segments, and the per-block graphs a whole-step graph falls "
         "back to), and the process's dynamo frame and graph-break totals; null when nothing is loaded.",
     )
+    fp8_gemm: Optional[Dict[str, Any]] = Field(
+        None,
+        description = "Which fp8 GEMM an fp8 load runs: path 'torchao_rowwise', or 'unit_scale_fallback' when this "
+        "torch build has no row-wise fp8 kernel on the card (Windows wheels), plus the per-card probe verdict and "
+        "eager call counts; null for a load without fp8.",
+    )
     loaded: bool = Field(False, description = "Whether a diffusion model is loaded")
     evicted: List[str] = Field(
         default_factory = list,
@@ -6584,6 +6599,11 @@ class DiffusionStatusResponse(BaseModel):
         default_factory = list,
         description = "The baked adapters as the load requested them, [{id, weight}]; empty when none. The "
         "Images page compares a LoRA selection against it to tell whether Generate needs a reload first",
+    )
+    lora_fuse: Optional[str] = Field(
+        None,
+        description = "Whether the attached LoRA set is folded into the denoiser weights: fused | pending | "
+        "disabled | bit_exact (speed mode off) | offload | quantized | unsupported; null without LoRAs",
     )
     transformer_cache_stats: Optional[dict] = Field(
         None,
@@ -6846,11 +6866,9 @@ class ImageGenerationRequest(BaseModel):
         le = 20.0,
         description = "[x-unsloth] Classifier-free guidance scale (default per model).",
     )
-    seed: Optional[int] = Field(
+    seed: MediaSeed = Field(
         None,
-        ge = 0,
-        le = 2**53 - 1,
-        description = "[x-unsloth] Seed for a repeatable image (random if omitted). With n > 1 "
+        description = "[x-unsloth] Seed for a repeatable image (random if omitted or -1). With n > 1 "
         "each image derives its own seed from it.",
     )
     negative_prompt: Optional[str] = Field(
@@ -6872,12 +6890,6 @@ class ImageGenerationRequest(BaseModel):
         if value is None:
             return cls.model_fields[info.field_name].default
         return value
-
-    @field_validator("seed", mode = "before")
-    @classmethod
-    def _minus_one_seed_means_random(cls, value):
-        # -1 = random (A1111, sd.cpp); seed was ignored here before, so -1 must not start 400ing.
-        return None if value == -1 else value
 
     @field_validator("loras")
     @classmethod
@@ -7488,6 +7500,7 @@ class AudioCatalogModel(BaseModel):
     display_name: str
     family: Optional[str] = None
     task: Literal["tts", "music", "asr", "sep", ""] = ""
+    separation_goal: Optional[Literal["stems", "speakers", "voice", "restore"]] = None
     workflows: List[
         Literal["speak", "clone", "edit", "convert", "music", "separate", "transcribe"]
     ] = Field(default_factory = list)
@@ -7539,11 +7552,9 @@ class VideoJobCreateRequest(BaseModel):
         None, description = "'<width>x<height>', a resolution preset of the loaded family."
     )
     # Unsloth Studio extensions; a plain OpenAI request leaves them all out.
-    seed: Optional[int] = Field(
+    seed: MediaSeed = Field(
         None,
-        ge = 0,
-        le = 2**53 - 1,
-        description = "Seed for a repeatable take. Omitted: Unsloth Studio draws one and returns "
+        description = "Seed for a repeatable take. Omitted or -1: Unsloth Studio draws one and returns "
         "it on the job.",
     )
     negative_prompt: Optional[str] = Field(
@@ -7988,10 +7999,7 @@ class VideoGenerateRequest(BaseModel):
         "pipeline default it to the main guidance. Ignored by single-DiT families (their pipeline "
         "signature has no second guidance kwarg).",
     )
-    # le = 2**53-1: seeds round-trip through JSON recipes, where JavaScript rounds larger integers and a restored recipe would differ.
-    seed: Optional[int] = Field(
-        None, ge = 0, le = 2**53 - 1, description = "Seed for reproducibility (random if omitted)"
-    )
+    seed: MediaSeed = Field(None, description = "Seed for reproducibility (random if omitted or -1)")
     # Bounded so one request cannot buffer a multi-GB payload; ~32 MiB fits a 4096px source.
     first_frame: Optional[str] = Field(
         None,

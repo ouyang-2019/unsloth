@@ -536,6 +536,7 @@ from state.tool_approvals import (
     wait_tool_decision,
 )
 from utils.paths.path_utils import _is_wsl, is_appledouble_metadata
+from utils.paths.storage_roots import studio_root
 from utils.code_integrity import code_integrity_block_reason, code_integrity_user_message
 from utils.first_token_timeout import (
     finish_first_token_wait,
@@ -2919,9 +2920,7 @@ class _SlotLaunchFingerprint(NamedTuple):
 
 
 def _swa_cache_path() -> Path:
-    home = os.environ.get("UNSLOTH_STUDIO_HOME") or os.environ.get("STUDIO_HOME")
-    base = Path(home) if home else Path.home() / ".unsloth" / "studio"
-    return base / "swa_cache.json"
+    return studio_root() / "swa_cache.json"
 
 
 def _load_swa_cache() -> dict:
@@ -8638,6 +8637,21 @@ _DEVICE_VISIBILITY_ENV = (
 # No internal spaces in the id excludes ggml_cuda_init's '  Device 0:' lines.
 _LISTED_DEVICE_RE = re.compile(r"^\s+(\S+):\s")
 _LIST_DEVICES_HEADER = "Available devices:"
+
+
+class _ExitedProcess:
+    """A reaped child's exit status: no pid or terminate(), so a kill never signals a reused pid."""
+
+    pid = None
+
+    def __init__(self, returncode: Optional[int]):
+        self.returncode = returncode
+
+    def poll(self) -> Optional[int]:
+        return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
+        return self.returncode
 
 
 def _parse_listed_devices(text: Optional[str]) -> Optional[list[str]]:
@@ -21655,7 +21669,7 @@ class LlamaCppBackend:
         self._llama_log_fh = None
         self._llama_log_path = None
         try:
-            log_dir = _swa_cache_path().parent / "logs" / "diffusion-server"
+            log_dir = studio_root() / "logs" / "diffusion-server"
             log_dir.mkdir(parents = True, exist_ok = True)
             self._llama_log_path = log_dir / f"diffusion-{int(time.time())}-port-{self._port}.log"
             self._llama_log_fh = open(self._llama_log_path, "w", encoding = "utf-8", buffering = 1)
@@ -25454,7 +25468,7 @@ class LlamaCppBackend:
         self._cleanup_cpu_fallback_runtime()
         staged_runtime = None
         try:
-            runtime_root = _swa_cache_path().parent / "runtime"
+            runtime_root = studio_root() / "runtime"
             runtime_root.mkdir(parents = True, exist_ok = True)
             _sweep_abandoned_cpu_runtimes(runtime_root)
             staged_runtime = tempfile.TemporaryDirectory(
@@ -25602,7 +25616,7 @@ class LlamaCppBackend:
         # Tees llama-server output to a log file for post-mortems; the parent keeps only the last 50 lines.
         self._llama_log_fh = None
         try:
-            log_dir = _swa_cache_path().parent / "logs" / "llama-server"
+            log_dir = studio_root() / "logs" / "llama-server"
             log_dir.mkdir(parents = True, exist_ok = True)
             self._llama_log_path = log_dir / f"llama-{int(time.time())}-port-{self._port}.log"
             self._llama_log_fh = open(
@@ -30585,8 +30599,28 @@ class LlamaCppBackend:
 
                     kv_cache_bytes = _kv_bytes(effective_ctx)
                     # Decide before the log line so it matches the argv.
+                    _user_margin_fit = False
                     if gpu_memory_mode == "manual" and gpu_layers >= 0:
                         use_fit = False
+                    elif (
+                        not use_fit
+                        and not _metal_full_offload_pinned
+                        and not tensor_parallel
+                        and self._pass_through_fit_target_needs_fitter(
+                            extra_args,
+                            # A list is positional over the child's devices: only an explicit
+                            # pick or one spanning every card keeps that order.
+                            spans_every_card = bool(gpu_ids)
+                            or gpu_indices is None
+                            or set(gpu_indices) >= {idx for idx, _free in _detected_gpus},
+                        )
+                    ):
+                        # The plan fits, so this is not a partial placement.
+                        use_fit = _user_margin_fit = True
+                        logger.info(
+                            "Pass-through --fit-target %s: keeping --fit on so llama.cpp honours it",
+                            fit_target_margin_in(extra_args, None),
+                        )
                     # Separate GPU drafter is a second model; None once CPU-offloaded (_mtp_draft_for_budget nulled).
                     _spill_inputs = {
                         "model_size": model_size,
@@ -30672,7 +30706,9 @@ class LlamaCppBackend:
                             LlamaCppBackend._explain_empty_gpu_probe(binary),
                         )
                     # Set last, so any early return or raise leaves it False.
-                    _placement_verdict_partial = bool(_detected_gpus) and bool(use_fit)
+                    _placement_verdict_partial = (
+                        bool(_detected_gpus) and bool(use_fit) and not _user_margin_fit
+                    )
 
                     # Load mode: mmap demand-pages what RAM cannot hold, so a fitting load wants none. Use gpus not _detected_gpus: arch gate empties it on --device none
                     _fit_devices = max(1, len(gpu_indices or ()) or len(gpus))
@@ -33555,6 +33591,9 @@ class LlamaCppBackend:
                 _spawn_cwd: Optional[str] = None
                 # An inherited LLAMA_ARG_FIT=off belongs to the user, and the flip would override it on the CLI.
                 _did_rocm_retry = False
+                # The system launch a signal-only bundle retry replaced; restored if it fails too.
+                _rocm_signal_undo: Optional[tuple] = None
+                _rocm_retry_undone = False
 
                 def _enable_managed_fit_for_no_flash(fa_cmd: list) -> list:
                     """Restores Unsloth's own --fit on for a --flash-attn off respawn, which is re-
@@ -33719,6 +33758,7 @@ class LlamaCppBackend:
                     # page-lock and writes it back, which without this makes the
                     # read below an UnboundLocalError instead.
                     nonlocal _last_spawn_cmd, _mem_host_resident, _did_rocm_retry
+                    nonlocal _rocm_signal_undo, _rocm_retry_undone
                     nonlocal _sched_abort_seen, _sidecar_fit_reserve_mib, effective_ctx
                     nonlocal _fit_retry_pool
                     # Single revocation point for the tensor-spill plan; label is empty only on the first spawn.
@@ -33755,7 +33795,7 @@ class LlamaCppBackend:
                         # pointed the user at.
                         self._llama_log_fh = None
                         try:
-                            log_dir = _swa_cache_path().parent / "logs" / "llama-server"
+                            log_dir = studio_root() / "logs" / "llama-server"
                             log_dir.mkdir(parents = True, exist_ok = True)
                             self._llama_log_path = log_dir / (
                                 f"llama-{int(time.time())}{label}-port-{self._port}"
@@ -34109,7 +34149,9 @@ class LlamaCppBackend:
                             cancelled = _load_cancelled,
                             **_wait_kwargs,
                         ):
-                            if _did_rocm_retry:
+                            # A later failure (an MTP probe respawn) must not undo a proven runtime.
+                            _rocm_signal_undo = None
+                            if _did_rocm_retry and not _rocm_retry_undone:
                                 # Proved on this host: every later child skips the
                                 # prepend instead of crashing into it first.
                                 self._remember_bundle_only_rocm(binary)
@@ -34125,6 +34167,26 @@ class LlamaCppBackend:
                         # captured settings while a crashed child leaves is_active false.
                         # Here rather than per rung, so a later rung cannot forget it.
                         self._memory_pending_launch = _mem_settings
+                        if _rocm_signal_undo is not None:
+                            # The bundle failed too, so no mix (#7233 hosts need the system ROCm):
+                            # recover from the system launch's own crash as if the retry never ran.
+                            self._kill_process()
+                            self._child_gpu_physical_ids = _child_gpu_physical_ids
+                            if self._stdout_thread is not None:
+                                self._stdout_thread.join(timeout = 2)
+                            _undo_ld, _undo_proc, _undo_lines, _undo_log = _rocm_signal_undo
+                            env["LD_LIBRARY_PATH"] = _undo_ld
+                            # Reaped before the bundle launch, so only its exit status comes back.
+                            _undo_proc = _ExitedProcess(_undo_proc.poll())
+                            with self._spawn_lock:
+                                self._process = _undo_proc
+                                self._process_env = (_undo_proc, env)
+                            self._stdout_lines = _undo_lines
+                            self._llama_log_path = _undo_log
+                            self._health_wait_stalled = False
+                            self._health_wait_stall_kind = None
+                            _rocm_signal_undo = None
+                            _rocm_retry_undone = True
                         if _fit_retry_restore is not None:
                             # Retry on the planned cards before reading anything off the widened child.
                             logger.warning(
@@ -34158,6 +34220,35 @@ class LlamaCppBackend:
                             "\n".join(self._stdout_lines)
                         ) or self._is_tensor_quant_kv_unsupported(_startup_output)
                         _hip_rocr_mismatch = self._is_bundled_hip_rocr_mismatch(_startup_output)
+                        # A GPF in the prepended system libamdhip64 exits -11 with no
+                        # symbol-lookup line (#18948), so a signal crash also earns the retry.
+                        _signal_mix = False
+                        if (
+                            not _did_rocm_retry
+                            and not _hip_rocr_mismatch
+                            and self._is_signal_crash(
+                                _crashed_proc.poll() if _crashed_proc is not None else None
+                            )
+                        ):
+                            _clean_env = self._llama_server_env_for_binary(
+                                binary, use_system_rocm = False
+                            )
+                            _clean_ld = _clean_env.get("LD_LIBRARY_PATH", "")
+                            _clean_dirs = _clean_ld.split(":")
+                            _env_dirs = env.get("LD_LIBRARY_PATH", "").split(":")
+                            # Dropping the prepend only removes dirs (a staged CPU runtime differs).
+                            # The bundle must see a GPU too: on #7233 hosts it passes /health on CPU.
+                            _hip_rocr_mismatch = (
+                                bool(_clean_ld)
+                                and len(_clean_dirs) < len(_env_dirs)
+                                and set(_clean_dirs) <= set(_env_dirs)
+                                and bool(
+                                    self._list_devices_under(
+                                        binary, {**env, "LD_LIBRARY_PATH": _clean_ld}
+                                    )
+                                )
+                            )
+                            _signal_mix = _hip_rocr_mismatch
                         # A startup crash means the spill prediction was wrong, so placement returns to llama.cpp.
                         _capability_crash = _tensor_capability_crash or self._is_kv_unified_refused(
                             "\n".join(self._stdout_lines)
@@ -34180,12 +34271,19 @@ class LlamaCppBackend:
                             if _retry_ld and _retry_ld != env.get("LD_LIBRARY_PATH"):
                                 logger.warning(
                                     "llama-server crashed during startup (exit code %s) "
-                                    "because a bundled ROCm library could not resolve a "
-                                    "symbol against the system ROCm; retrying once "
-                                    "with the bundled runtime only. Crash log: %s",
+                                    "with the system ROCm libraries prepended; "
+                                    "retrying once with the bundled runtime only. "
+                                    "Crash log: %s",
                                     _crashed_proc.returncode,
                                     self._llama_log_path,
                                 )
+                                if _signal_mix:
+                                    _rocm_signal_undo = (
+                                        env.get("LD_LIBRARY_PATH"),
+                                        _crashed_proc,
+                                        self._stdout_lines,
+                                        self._llama_log_path,
+                                    )
                                 env["LD_LIBRARY_PATH"] = _retry_ld
                                 _did_rocm_retry = True
                                 continue
@@ -34317,6 +34415,30 @@ class LlamaCppBackend:
                             # The fit that vouched for the ceiling is what just failed.
                             self._vram_fit_context_length = None
                             continue
+                        if (
+                            not _did_fit_retry
+                            and _user_margin_fit
+                            and _startup_crashed
+                            and not _capability_crash
+                            and not _hip_rocr_mismatch
+                        ):
+                            # The fitter ran only to honour the user's --fit-target on Auto's pick
+                            # (#19269); a memory crash disproves the estimate that left the other
+                            # cards out, so retry on them as a --fit off launch would (#19402).
+                            _restore_before = _fit_retry_restore
+                            _widen_fit_retry_mask(run_cmd)
+                            if _fit_retry_restore is not _restore_before:
+                                logger.warning(
+                                    "llama-server crashed during startup (exit code %s) "
+                                    "with --fit on for a --fit-target margin; retrying once "
+                                    "on every card Auto could have picked. Crash log: %s",
+                                    _crashed_proc.returncode,
+                                    self._llama_log_path,
+                                )
+                                self._record_memory_state(run_cmd, env)
+                                _did_fit_retry = True
+                                self._vram_fit_context_length = None
+                                continue
                         if (
                             not _did_fit_retry
                             and _fit_retry_allowed
@@ -37649,7 +37771,6 @@ class LlamaCppBackend:
         (per-root, so concurrent Unsloth instances with distinct UNSLOTH_STUDIO_HOME stay
         isolated, mirroring the reaper's custom-root isolation)."""
         try:
-            from utils.paths.storage_roots import studio_root  # noqa: WPS433
             return studio_root() / "llama-server.pid"
         except Exception:
             return None
@@ -38359,6 +38480,23 @@ class LlamaCppBackend:
             layout = None
         self._spill_layout_cache = (key, layout)
         return layout
+
+    @staticmethod
+    def _pass_through_fit_target_needs_fitter(
+        extra_args: Optional[Iterable[str]], *, spans_every_card: bool = True
+    ) -> bool:
+        """A user --fit-target with no -fit / -ngl of its own: llama.cpp reads it only while the
+        fitter runs (common_fit_apply), so --fit off would drop it silently (#19240)."""
+        try:
+            raw = _last_flag_value(extra_args, {"-fitt", "--fit-target"})
+        except ValueError:
+            return False
+        if raw is None or fit_target_margin_in([f"--fit-target={raw}"], None) is None:
+            return False
+        if _extra_args_set_any_flag(extra_args, _LAYER_OFFLOAD_FLAGS):
+            return False
+        # A narrowed pick renumbers the child's devices, so a list would land on the wrong card.
+        return spans_every_card or not any(sep in raw for sep in ",/")
 
     @staticmethod
     def _fit_off_retry_eligible(cmd: "list[str]", use_fit: bool) -> bool:

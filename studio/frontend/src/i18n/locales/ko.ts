@@ -882,10 +882,17 @@ export const ko = {
   chatMenu: {
     more: "채팅 옵션",
     copy: "복사",
-    addScheduledTask: "예약 작업 추가…",
+    addScheduledTask: "예약 작업 추가",
     compact: "대화 압축",
     compactEmpty: "아직 압축할 내용이 없습니다",
     compactUnsupported: "대화 압축에는 도구를 지원하는 GGUF 또는 MLX 모델이 필요합니다",
+  },
+  chatFiles: {
+    title: "이 채팅의 파일",
+    code: "코드 스니펫",
+    showInChat: "채팅에서 보기",
+    download: "{name} 다운로드",
+    saveFailed: "{name}을(를) 저장할 수 없습니다.",
   },
   welcome: {
     goodToSeeYou: "반가워요",
@@ -966,6 +973,7 @@ export const ko = {
     saving: "저장 중...",
     search: "검색",
     shutdown: "종료",
+    technicalDetails: "기술 세부 정보",
   },
   shell: {
     helpMenu: {
@@ -4108,8 +4116,8 @@ export const ko = {
       summary: {
         single: "GPU 1개로 학습",
         layerSplit: "모델을 레이어 단위로 GPU {count}개에 분할",
-        ddp: "모델이 GPU 1개에 들어갑니다: GPU {count}개에서 데이터 병렬",
-        fsdp2: "모델이 GPU 1개에 비해 너무 큽니다: GPU {count}개에 샤딩",
+        ddp: "각 GPU가 전체 복사본을 학습합니다: GPU {count}개에서 데이터 병렬",
+        fsdp2: "가중치와 옵티마이저 상태를 GPU {count}개에 샤딩",
         tp: "각 레이어를 GPU {count}개에 분할",
         pp: "레이어를 GPU마다 하나씩 {count}단계 파이프라인으로 실행",
         cp: "각 시퀀스를 GPU {count}개에 분할",
@@ -4120,7 +4128,7 @@ export const ko = {
         noGpu: "GPU를 하나 이상 선택하세요.",
         singleNeedsOne: "단일 GPU는 GPU 하나만 사용합니다. 나머지는 선택 해제하세요.",
         needsTwo: "이 모드에는 GPU가 2개 이상 필요합니다.",
-        customSpec: "구성을 입력하세요. 예: dp=2,tp=2",
+        customSpec: "구성을 입력하세요. 예: {example}",
       },
     },
     preview: {
@@ -5020,6 +5028,7 @@ export const ko = {
     model: {
       label: "번역 모델",
       fast: "빠름",
+      balanced: "균형",
       quality: "최고 품질",
       chat: "채팅 모델",
       recommended: "추천",
@@ -5041,11 +5050,11 @@ export const ko = {
       toneFormal: "격식체",
       toneCasual: "일상체",
       auto: "입력하는 대로 번역",
-      autoDescription: "모델이 로드되면 시작됩니다. 입력만으로는 다운로드가 시작되지 않습니다.",
+      autoDescription: "모델이 로드되면 자동으로 시작됩니다.",
       saveHistory: "기록 저장",
       saveHistoryDescription: "이 브라우저에만 보관됩니다.",
       showPrompt: "프롬프트 표시",
-      showPromptDescription: "모델에 전송되는 정확한 지시문을 확인합니다.",
+      showPromptDescription: "모델에 보내는 정확한 지시를 확인합니다.",
     },
     history: {
       title: "기록",
@@ -6013,6 +6022,12 @@ export const ko = {
     maximize: "창 최대화",
     restore: "창 복원",
     close: "창 닫기",
+    mediaCodecs: {
+      title: "생성된 동영상이 재생되지 않을 수 있습니다",
+      // {command}: an apt command line, never translated.
+      description: "이 시스템에 GStreamer 동영상 디코더가 없습니다. 다음 명령으로 설치하세요: {command}",
+      copy: "명령 복사",
+    },
   },
   runtimeUpdate: {
     installAudio: "오디오 런타임 설치",
@@ -6107,7 +6122,6 @@ export const ko = {
     back: "뒤로",
     continue: "계속",
     skipSetup: "설정 건너뛰기",
-    outsideAgain: "닫으려면 바깥쪽을 한 번 더 클릭하세요",
     getStarted: "시작하기",
     progress: "{total}단계 중 {current}단계",
     welcome: {

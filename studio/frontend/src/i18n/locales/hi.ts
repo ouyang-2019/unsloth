@@ -882,10 +882,17 @@ export const hi = {
   chatMenu: {
     more: "चैट विकल्प",
     copy: "कॉपी करें",
-    addScheduledTask: "शेड्यूल किया गया कार्य जोड़ें…",
+    addScheduledTask: "शेड्यूल किया गया कार्य जोड़ें",
     compact: "बातचीत कॉम्पैक्ट करें",
     compactEmpty: "अभी कॉम्पैक्ट करने के लिए कुछ नहीं है",
     compactUnsupported: "कॉम्पैक्शन के लिए टूल सपोर्ट वाला GGUF या MLX मॉडल आवश्यक है",
+  },
+  chatFiles: {
+    title: "इस चैट की फ़ाइलें",
+    code: "कोड स्निपेट",
+    showInChat: "चैट में दिखाएँ",
+    download: "{name} डाउनलोड करें",
+    saveFailed: "{name} सहेजा नहीं जा सका।",
   },
   welcome: {
     goodToSeeYou: "आपको देखकर अच्छा लगा",
@@ -970,6 +977,7 @@ export const hi = {
     saving: "सहेजा जा रहा है...",
     search: "खोजें",
     shutdown: "शटडाउन",
+    technicalDetails: "तकनीकी विवरण",
   },
   shell: {
     helpMenu: {
@@ -4130,8 +4138,8 @@ export const hi = {
       summary: {
         single: "एक GPU पर ट्रेनिंग",
         layerSplit: "मॉडल को लेयर दर लेयर {count} GPU पर बांटा गया है",
-        ddp: "मॉडल एक GPU में फिट होता है: {count} GPU पर डेटा पैरेलल",
-        fsdp2: "मॉडल एक GPU के लिए बहुत बड़ा है: {count} GPU पर शार्ड किया गया",
+        ddp: "हर GPU पूरी कॉपी ट्रेन करता है: {count} GPU पर डेटा पैरेलल",
+        fsdp2: "वेट और ऑप्टिमाइज़र स्टेट {count} GPU पर शार्ड किए गए",
         tp: "हर लेयर को {count} GPU पर बांटा गया है",
         pp: "लेयर {count} पाइपलाइन चरणों के रूप में चलती हैं, हर GPU पर एक",
         cp: "हर सीक्वेंस को {count} GPU पर बांटा गया है",
@@ -4142,7 +4150,7 @@ export const hi = {
         noGpu: "कम से कम एक GPU चुनें।",
         singleNeedsOne: "एक GPU मोड ठीक एक GPU का उपयोग करता है। बाकी का चिह्न हटाएं।",
         needsTwo: "इस मोड के लिए कम से कम दो GPU चाहिए।",
-        customSpec: "लेआउट दर्ज करें, उदाहरण के लिए dp=2,tp=2।",
+        customSpec: "लेआउट दर्ज करें, उदाहरण के लिए {example}।",
       },
     },
     preview: {
@@ -5042,6 +5050,7 @@ export const hi = {
     model: {
       label: "अनुवाद मॉडल",
       fast: "तेज़",
+      balanced: "संतुलित",
       quality: "सर्वोत्तम गुणवत्ता",
       chat: "चैट मॉडल",
       recommended: "सुझाए गए",
@@ -5063,7 +5072,7 @@ export const hi = {
       toneFormal: "औपचारिक",
       toneCasual: "अनौपचारिक",
       auto: "टाइप करते ही अनुवाद करें",
-      autoDescription: "मॉडल लोड होने के बाद शुरू होता है। टाइप करने से कभी डाउनलोड शुरू नहीं होता।",
+      autoDescription: "मॉडल लोड होने पर अपने-आप शुरू होता है।",
       saveHistory: "हिस्ट्री सहेजें",
       saveHistoryDescription: "सिर्फ़ इसी ब्राउज़र में रखी जाती है।",
       showPrompt: "प्रॉम्प्ट दिखाएँ",
@@ -6035,6 +6044,12 @@ export const hi = {
     maximize: "विंडो बड़ी करें",
     restore: "विंडो पहले जैसी करें",
     close: "विंडो बंद करें",
+    mediaCodecs: {
+      title: "जनरेट किए गए वीडियो शायद न चलें",
+      // {command}: an apt command line, never translated.
+      description: "इस सिस्टम में GStreamer वीडियो डिकोडर नहीं हैं। इन्हें इस कमांड से इंस्टॉल करें: {command}",
+      copy: "कमांड कॉपी करें",
+    },
   },
   runtimeUpdate: {
     installAudio: "ऑडियो रनटाइम इंस्टॉल करें",
@@ -6129,7 +6144,6 @@ export const hi = {
     back: "वापस",
     continue: "जारी रखें",
     skipSetup: "सेटअप छोड़ें",
-    outsideAgain: "बंद करने के लिए फिर से बाहर क्लिक करें",
     getStarted: "शुरू करें",
     progress: "चरण {current} / {total}",
     welcome: {

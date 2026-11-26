@@ -882,10 +882,17 @@ export const es = {
   chatMenu: {
     more: "Opciones del chat",
     copy: "Copiar",
-    addScheduledTask: "Añadir tarea programada…",
+    addScheduledTask: "Añadir tarea programada",
     compact: "Compactar conversación",
     compactEmpty: "Aún no hay nada que compactar",
     compactUnsupported: "La compactación requiere un modelo GGUF o MLX compatible con herramientas",
+  },
+  chatFiles: {
+    title: "Archivos de este chat",
+    code: "Fragmentos de código",
+    showInChat: "Mostrar en el chat",
+    download: "Descargar {name}",
+    saveFailed: "No se ha podido guardar {name}.",
   },
   welcome: {
     goodToSeeYou: "Me alegra verte",
@@ -969,6 +976,7 @@ export const es = {
     saving: "Guardando...",
     search: "Buscar",
     shutdown: "Apagar",
+    technicalDetails: "Detalles técnicos",
   },
   shell: {
     helpMenu: {
@@ -4164,8 +4172,8 @@ export const es = {
       summary: {
         single: "Entrenando en una GPU",
         layerSplit: "El modelo se divide capa por capa entre {count} GPU",
-        ddp: "El modelo cabe en una GPU: paralelismo de datos en {count} GPU",
-        fsdp2: "El modelo no cabe en una GPU: fragmentado entre {count} GPU",
+        ddp: "Cada GPU entrena una copia completa: paralelismo de datos en {count} GPU",
+        fsdp2: "Pesos y estado del optimizador fragmentados entre {count} GPU",
         tp: "Cada capa se divide entre {count} GPU",
         pp: "Las capas se ejecutan como {count} etapas de pipeline, una por GPU",
         cp: "Cada secuencia se divide entre {count} GPU",
@@ -4176,7 +4184,7 @@ export const es = {
         noGpu: "Selecciona al menos una GPU.",
         singleNeedsOne: "Una sola GPU usa exactamente una GPU. Desmarca las demás.",
         needsTwo: "Este modo necesita al menos dos GPU.",
-        customSpec: "Escribe una distribución, por ejemplo dp=2,tp=2.",
+        customSpec: "Escribe una distribución, por ejemplo {example}.",
       },
     },
     preview: {
@@ -5104,6 +5112,7 @@ export const es = {
     model: {
       label: "Modelo de traducción",
       fast: "Rápido",
+      balanced: "Equilibrado",
       quality: "Mejor calidad",
       chat: "Modelo de chat",
       recommended: "Recomendados",
@@ -5125,11 +5134,11 @@ export const es = {
       toneFormal: "Formal",
       toneCasual: "Informal",
       auto: "Traducir mientras escribes",
-      autoDescription: "Empieza cuando el modelo está cargado. Escribir nunca inicia una descarga.",
+      autoDescription: "Empieza automáticamente cuando el modelo está cargado.",
       saveHistory: "Guardar historial",
       saveHistoryDescription: "Se guarda solo en este navegador.",
       showPrompt: "Mostrar prompt",
-      showPromptDescription: "Consulta las instrucciones exactas enviadas al modelo.",
+      showPromptDescription: "Ver las instrucciones exactas enviadas al modelo.",
     },
     history: {
       title: "Historial",
@@ -6097,6 +6106,12 @@ export const es = {
     maximize: "Maximizar ventana",
     restore: "Restaurar ventana",
     close: "Cerrar ventana",
+    mediaCodecs: {
+      title: "Es posible que los vídeos generados no se reproduzcan",
+      // {command}: an apt command line, never translated.
+      description: "A este sistema le faltan los decodificadores de vídeo de GStreamer. Instálalos con: {command}",
+      copy: "Copiar comando",
+    },
   },
   runtimeUpdate: {
     installAudio: "Instalar el runtime de audio",
@@ -6191,7 +6206,6 @@ export const es = {
     back: "Atrás",
     continue: "Continuar",
     skipSetup: "Omitir configuración",
-    outsideAgain: "Haz clic fuera otra vez para cerrar",
     getStarted: "Empezar",
     progress: "Paso {current} de {total}",
     welcome: {
