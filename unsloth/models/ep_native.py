@@ -108,6 +108,7 @@ def ep_env_mesh():
 
 def ep_env_load(fn, args, kwargs, sharded):
     """from_pretrained under UNSLOTH_EP_SIZE; `sharded` False (adapter or QAT load) loads in full."""
+    _lists().keep_zoo_expert_loops()
     if not sharded:
         return fn(*args, **kwargs)
     try:
@@ -177,11 +178,14 @@ def ep_refuse_per_expert_lists(model):
     experts are per-expert Linear lists (zoo's GptOssExpertsBnb4bit for a load_in_4bit gpt-oss)."""
     if not isinstance(model, nn.Module) or is_expert_parallel(model):
         return
-    tpn = _tpn()
-    problems = [
-        tpn.expert_shard_problem(block, ep_env_size())
-        for block in tpn.moe_blocks_with_experts(model)
-    ]
+    tpn, lists = _tpn(), _lists()
+    problems = []
+    for block in tpn.moe_blocks_with_experts(model):
+        why = lists.fused_list_problem(block, ep_env_size())
+        problem = None if why is None else tpn.expert_shard_problem(block, ep_env_size())
+        if isinstance(problem, str) and problem.startswith(_PER_EXPERT_LISTS) and why != problem:
+            problem = f"{problem}; not shardable as per-expert lists either: {why}"
+        problems.append(problem)
     message = _per_expert_lists_refusal(problems)
     if message is not None:
         raise NotImplementedError(message)
@@ -311,7 +315,8 @@ def _ep_expert_chunk(shard, prior, dense, got_x, row, ic, wc):
 
 
 def _ep_experts_chunked(shard, prior, dense, got_x, row, ic, wc, rows):
-    from torch.utils.checkpoint import checkpoint
+    # torch's own: smart GC's replacement would offload each chunk and drop closed-over expert LoRA grads.
+    checkpoint = _tpn()._torch_checkpoint()
 
     y_got = None
     for start in range(0, row.numel(), rows):
@@ -436,7 +441,9 @@ def _localize(shard, ep):
         owner._parameters[name] = local
     shard.swaps = []  # nothing left to swap: the parameters are local
     for p in shard.leaf._parameters.values():
-        if tpn._is_params4bit(p):
+        # Frozen quantized stacks (bitsandbytes 4-bit, zoo's packed NVFP4 / MXFP8 / MXFP4): already this rank's
+        # experts, never in an adapter, never gathered.
+        if tpn._is_params4bit(p) or tpn._is_packed_expert(p):
             p.__dict__.pop("_unsloth_tp_layout", None)
             setattr(p, _EP, ("4bit", shard.experts, ep))
 
@@ -494,25 +501,42 @@ def apply_expert_parallel(model, mesh = None):
         raise NotImplementedError(
             "Unsloth: expert parallel cannot be combined with tensor parallel / FSDP2."
         )
+    _lists().check_remote_layout(model, ep, rank, ep_mesh.mesh.tolist())
     blocks = tpn.moe_blocks_with_experts(model)
-    sharded, kept = [], []
+    sharded, kept, listed, fused_lists = [], [], [], []
     for block in blocks:
         problem = tpn.expert_shard_problem(block, ep)
         if problem is None and ep > 1:
             sharded.append(block)
+        elif ep > 1 and _lists().list_shard_problem(block, ep) is None:
+            # transformers 4.x per-expert ModuleList: the block loops its experts itself
+            listed.append(block)
+        elif ep > 1 and _lists().fused_list_problem(block, ep) is None:
+            # one experts call over per-expert Linear lists (zoo's load_in_4bit gpt-oss)
+            fused_lists.append(block)
         else:
+            why = _lists().fused_list_problem(block, ep) if ep > 1 else None
+            if (
+                isinstance(problem, str)
+                and problem.startswith(_PER_EXPERT_LISTS)
+                and why != problem
+            ):
+                problem = f"{problem}; not shardable as per-expert lists either: {why}"
             kept.append((block, problem))
     for block, problem in kept:
         chain = tpn._experts_chain(block)
-        if chain and any(
-            getattr(p, tpn._EXPERT_PRELOAD, None) is not None
-            for p in chain[-1]._parameters.values()
-        ):
+        if (
+            chain
+            and any(
+                getattr(p, tpn._EXPERT_PRELOAD, None) is not None
+                for p in chain[-1]._parameters.values()
+            )
+        ) or any(_lists().is_remote(p) for p in block.parameters()):
             raise ValueError(
                 f"Unsloth: expert_parallel_loading kept only this rank's experts of "
                 f"{type(block).__name__}, but they cannot be sharded now ({problem}); load in full."
             )
-    if not sharded:
+    if not sharded and not listed and not fused_lists:
         message = _per_expert_lists_refusal([p for _, p in kept]) if ep > 1 else None
         if message is not None:
             raise NotImplementedError(message)
@@ -531,11 +555,20 @@ def apply_expert_parallel(model, mesh = None):
         if plain is not None:
             block.forward = plain(block)
         _guard_bypass(block, shard)
+    for block in listed:
+        _lists().shard_expert_list(block, ep_mesh, rank, ep)
+    for block in fused_lists:
+        shard = _lists().shard_fused_lists(block, ep_mesh, rank, ep)
+        plain = _BLOCK_FORWARDS.get(type(block).__name__)
+        if plain is not None:
+            block.forward = plain(block)
+        _guard_bypass(block, shard)
     for _, p in _ep_params(model):
         if p.requires_grad:
             # DDP averages the other gradients over the world; an expert's is the sum over its ep group's losses
             # (then over the replicas, ep_sync_expert_grads): / world is DDP's average.
             p.register_hook(lambda g, world = world: g / world)
+    tpn._drop_remote_device_map(model, ep, rank)
     for level in _levels(model):
         level.__dict__[_EP] = ep_mesh
         level.__dict__[_EP_REP] = rep_mesh
@@ -549,16 +582,30 @@ def apply_expert_parallel(model, mesh = None):
             n for n in names if n not in set(ignored)
         ]
     if rank == 0:
+        first = (
+            sharded[0].__dict__["_unsloth_tp_expert_shard"]
+            if sharded
+            else (listed or fused_lists)[0].__dict__[_lists()._SHARD]
+        )
         print(
             f"Unsloth: expert parallel ep={ep}"
             + (f" x {rep_mesh.size()} replicas" if rep_mesh is not None else "")
-            + f": {len(sharded)} mixture-of-experts blocks keep "
-            f"{sharded[0].__dict__['_unsloth_tp_expert_shard'].per_rank} of "
-            f"{sharded[0].__dict__['_unsloth_tp_expert_shard'].experts} routed experts per rank"
+            + f": {len(sharded) + len(listed) + len(fused_lists)} mixture-of-experts blocks keep "
+            f"{first.per_rank} of {first.experts} routed experts per rank"
+            + (
+                f" ({len(listed) + len(fused_lists)} as per-expert modules)"
+                if listed or fused_lists
+                else ""
+            )
             + (f", {len(kept)} kept whole" if kept else "")
             + "."
         )
     return model
+
+
+def _lists():
+    from . import ep_expert_lists
+    return ep_expert_lists
 
 
 def _mesh(model):
@@ -662,7 +709,10 @@ def _ep_save_entrypoints(level):
         @functools.wraps(prior_save)
         def save_pretrained(*args, **kwargs):
             if _SAVING or kwargs.get("state_dict") is not None:
-                return prior_save(*args, **kwargs)
+                with _lists().remote_experts_for_save(
+                    level
+                ):  # a gathered state dict keeps every expert
+                    return prior_save(*args, **kwargs)
             if kwargs.get("push_to_hub"):
                 raise NotImplementedError(_EP_PUSH_REFUSAL)
             from peft import PeftModel
@@ -672,7 +722,7 @@ def _ep_save_entrypoints(level):
             ):
                 raise NotImplementedError(
                     "Unsloth: save_pretrained of the whole model under expert parallel would write only this "
-                    "rank's 4-bit expert stacks. Save the adapter (the PEFT model's save_pretrained or "
+                    "rank's quantized (4-bit or packed) expert stacks. Save the adapter (the PEFT model's save_pretrained or "
                     "trainer.save_model), or save from one process."
                 )
             # Only global rank 0 writes: only it receives the gathered tensors (the adapter's alone for a PEFT
@@ -684,7 +734,8 @@ def _ep_save_entrypoints(level):
                     return None
                 _SAVING.append(True)
                 try:
-                    return prior_save(*args, state_dict = state, **kwargs)
+                    with _lists().remote_experts_for_save(level):
+                        return prior_save(*args, state_dict = state, **kwargs)
                 finally:
                     _SAVING.pop()
 
@@ -845,8 +896,11 @@ def ep_full_adapter_state_dict(
         return None
     receives = dst is None or dist.get_rank() == dst
     state = dict(model.state_dict()) if receives else None
+    lists = bool(_lists().list_blocks(model))  # every rank, also one holding none of the experts
     for n, p in model.named_parameters():
         layout = getattr(p, _EP, None)
+        if layout is not None and layout[0] == _lists().LIST:
+            continue  # whole per-expert modules: gathered by name below
         if layout is None or layout[0] == "4bit":  # the frozen 4-bit stacks are not in an adapter
             continue
         if adapter and not (p.requires_grad or "lora_" in n):
@@ -854,6 +908,13 @@ def ep_full_adapter_state_dict(
         full = _gather_expert(p, group, dst = dst)
         if receives:
             state[n] = full if dst is None else full.cpu()
+    if lists:
+        gathered = _lists().gather_list_state(model, group, dst = dst, adapter = adapter)
+        if receives:
+            if dst is None:  # every rank keeps it: back on the device the parameters live on
+                device = next(p.device for p in model.parameters())
+                gathered = {k: v.to(device) for k, v in gathered.items()}
+            state.update(gathered)
     return state
 
 
