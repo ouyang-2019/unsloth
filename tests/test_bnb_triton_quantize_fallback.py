@@ -28,7 +28,8 @@ import pytest
 
 from real_accelerator import has_real_cuda  # tests/_shared, on sys.path via tests/conftest.py
 
-pytest.importorskip("bitsandbytes")
+if getattr(pytest.importorskip("bitsandbytes"), "__unsloth_shim__", False):
+    pytest.skip("needs the native bitsandbytes, not Unsloth's stand-in", allow_module_level = True)
 pytest.importorskip("triton")
 torch = pytest.importorskip("torch")
 
@@ -180,5 +181,4 @@ def test_real_triton_without_a_compiler(tmp_path, patch):
     if not patch:
         assert not result["ok"] and "Failed to find C compiler" in result["error"], result
     else:
-        # bitsandbytes' PyTorch kernels match its native CUDA ones bit for bit.
         assert result == {"ok": True, "packed_equal": True, "absmax_equal": True}, result

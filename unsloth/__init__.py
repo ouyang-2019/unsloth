@@ -59,6 +59,17 @@ from .parallel_env import bind_local_cuda_device as _bind_local_cuda_device
 _bind_local_cuda_device()
 del _bind_local_cuda_device
 
+# Without a usable bitsandbytes, 4bit QLoRA runs on Unsloth's NF4 stand-in (unsloth/bnb_shim).
+# Before transformers / PEFT read bitsandbytes availability, after the device binding above (probing
+# an installed bitsandbytes initialises CUDA). UNSLOTH_BNB_SHIM=0 opts out.
+try:
+    from .bnb_shim import install as _install_bnb_shim
+    _install_bnb_shim()
+    del _install_bnb_shim
+except Exception as _bnb_shim_error:
+    print(f"Unsloth: could not set up the bitsandbytes stand-in ({_bnb_shim_error}).")
+    del _bnb_shim_error
+
 # Before transformers, which reads sentencepiece availability during its own import. On Windows
 # the extension is never imported at all: a code integrity policy can refuse it by reputation,
 # and any probe to find out whether this machine will is itself the refusal the user sees. See
@@ -157,6 +168,9 @@ class _UnslothDeviceStats:
         self.major = 0
         self.minor = 0
         self.multi_processor_count = 0
+        # MLX hosts return this from torch.cuda.get_device_properties. Inductor's cache key reads gcnArchName when
+        # torch.version.cuda is None (CacheBase.get_system), so every CPU torch.compile raised AttributeError there.
+        self.gcnArchName = name
 
 
 class _CPUBackendSelected(Exception):
@@ -415,6 +429,10 @@ if _IS_MLX:
     del _raw_text, _raw_text_spec, _raw_text_path, _Path
 
     def _mlx_from_pretrained(*args, **kwargs):
+        # mlx-lm reads safetensors only: a GGUF request fails loudly here instead of loading something else.
+        from ._gguf_load import refuse_gguf_on_mlx
+
+        refuse_gguf_on_mlx(args[0] if args else kwargs.get("model_name"), kwargs.get("gguf_file"))
         # CUDA's vLLM options and defaults; zoo's loader takes none of them.
         fast_inference = kwargs.pop("fast_inference", False)
         gpu_memory_utilization = kwargs.pop("gpu_memory_utilization", 0.5)

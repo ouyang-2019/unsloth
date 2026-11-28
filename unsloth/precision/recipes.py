@@ -512,6 +512,43 @@ _add(
     )
 )
 
+_W4A16_GATES = {
+    "sm75": Gate("unprobed", "fp16 activations (no bfloat16 there)"),
+    "sm80": Gate("unprobed"),
+    "sm89": Gate("unprobed"),
+    "sm90": Gate("unprobed", "H100 is not available to test on"),
+    "sm100": Gate(
+        "explicit", evidence = "LoRA correctness on tiny Qwen3 / Qwen3-MoE, " + _PROBE_B200
+    ),
+    "sm120": Gate("unprobed"),
+    "rocm": Gate("unprobed", "the Triton dequant runs; the fused kernel is off on ROCm"),
+}
+for _fmt, _gran, _scale, _note in (
+    ("nvfp4", "block1x16", "e4m3", "fp32 global scale per tensor, 4over6 block scales by default"),
+    (
+        "mxfp4",
+        "block1x32",
+        "e8m0",
+        "OCP MXFP4 values in the NVFP4 kernel layout (e8m0 scales stored as e4m3 under a power-of-two "
+        "global scale, bfloat16 when the block exponents span more than 17 octaves)",
+    ),
+):
+    _add(
+        Recipe(
+            name = f"onthefly_{_fmt}_w4a16",
+            kind = "frozen_base",
+            modes = ("lora",),
+            fwd = GemmPolicy(None, _op("e2m1", _gran, _scale)),
+            dgrad = GemmPolicy(None, _op("e2m1", _gran, _scale)),
+            input_dtypes = ("bf16", "fp16"),
+            compile = "opaque",
+            backend = f"unsloth.kernels.nvfp4 (load_in_4bit = '{_fmt}': quantized at load from a 16-bit checkpoint)",
+            gates = dict(_W4A16_GATES),
+            notes = "W4A16: the weight is dequantized to the activation dtype (or decoded inside the fused "
+            "Triton GEMM), no FP4 tensor-core GEMM; " + _note,
+        )
+    )
+
 _FP8_LORA_RUNS = (
     "Qwen3 LoRA r=16, seq 2048, bs 2, 200 steps on alpaca-cleaned, eval every 50 steps on 32 held-out "
     "rows, 2 seeds, vs bf16 LoRA in the same Colab VM"
@@ -544,8 +581,14 @@ _add(
             "sm100": Gate("unprobed"),
             "sm120": Gate(
                 "explicit",
-                evidence = "RTX PRO 6000: 1.08-1.10x at Qwen3-0.6B, 1.17x at 1.7B; rowwise "
-                "(fp8_lora_rowwise) is faster there. " + _FP8_LORA_RUNS,
+                evidence = "RTX 5090 (Windows, torch 2.14.1, which has no row-wise _scaled_mm kernel; bs 4 x "
+                "2048): step 1.12x bf16 at Qwen3-1.7B and 1.27x at Qwen3-8B (A/A under 0.1%), behind "
+                "int8_lora_rotated (1.29x / 1.59x). At bs 8 x 512 on torch 2.13 it ran 0.66x bf16 at "
+                "Qwen3-1.7B (A/A 1.3%). RTX PRO 6000, earlier probe ("
+                + _FP8_LORA_RUNS
+                + "): 1.08-1.10x at "
+                "Qwen3-0.6B and 1.17x at 1.7B. This has not been re-measured. The rowwise recipe's matching "
+                "1.22x at 1.7B re-measured at 0.99x on torch 2.14.1 (see fp8_lora_rowwise)",
             ),
             "rocm": Gate("refused", "ROCm fp8 (fnuz) GEMMs are not wired for the frozen base"),
         },
@@ -579,8 +622,13 @@ _add(
             "sm100": Gate("unprobed"),
             "sm120": Gate(
                 "explicit",
-                evidence = "RTX PRO 6000, 16-bit master in host RAM (default): step 1.16x bf16 at Qwen3-0.6B "
-                "(A/A 0.02%), 1.22x at 1.7B (A/A 0.17%); peak memory -12% / -33% vs bf16 LoRA. Eval loss "
+                evidence = "RTX PRO 6000 on a torch build with the row-wise _scaled_mm kernel (Linux; the Windows "
+                "wheels run unit-scale tensorwise GEMMs instead; see fp8_lora_tensorwise), default "
+                "settings, torch 2.14.1, bs 4 x 2048, 25 steps: step 0.99x bf16 at Qwen3-1.7B, 1.02x at "
+                "Qwen3-4B and 1.13x at Qwen3-8B (bf16 A/A 0.09% / 0.16% / 0.69%). It only pays at about 8B, "
+                "and int8_lora_rotated is faster at each size (1.05x / 1.11x / 1.22x). Peak memory is 8% "
+                "lower than bf16 LoRA at 1.7B and 13% lower at 8B. An earlier probe on the setup below "
+                "measured 1.16x at Qwen3-0.6B and 1.22x at 1.7B, which no longer reproduces. Eval loss "
                 "(fp8 forward) +0.48-0.56% at 0.6B, +0.32-0.54% at 1.7B (bf16 seed band 0.02%); the trained "
                 "adapter on the exact 16-bit base +0.06-0.12%. Explicit, not named: the fp8-forward eval gap "
                 "passes jobs/compare.py (rtol 5%) but not the 0.5% bar at 0.6B. " + _FP8_LORA_RUNS,
@@ -588,6 +636,68 @@ _add(
             "rocm": Gate("refused", "ROCm fp8 (fnuz) GEMMs are not wired for the frozen base"),
         },
         notes = "per-token activation / gradient scales, the weight's tensorwise scale broadcast per column",
+    )
+)
+
+_add(
+    Recipe(
+        name = "int8_lora_rotated",
+        kind = "frozen_base",
+        modes = ("lora",),
+        fwd = GemmPolicy(_op("int8", "row", rht = True), _op("int8", "row", rht = True)),
+        dgrad = GemmPolicy(_op("int8", "row"), _op("int8", "row", rht = True)),
+        hp_layers = _HP_FP8,
+        grad_scaler = "per_dtype",  # fp16 activations need loss scaling, as for fp8 LoRA
+        input_dtypes = ("bf16", "fp16"),
+        compile = "opaque",
+        backend = "unsloth.kernels.int8_lora (UNSLOTH_LORA_BASE_INT8=1, or float8_training = 'int8_lora')",
+        gates = {
+            "sm75": Gate(
+                "refused",
+                "T4: Triton (3.8) does not compile int8 dots for sm_75. cuBLAS int8 (torch._int_mm) runs at "
+                "1.76x / 1.81x an fp16 GEMM there (geomean over Qwen3 1.7B-8B layers, forward / input gradient), "
+                "but the block rotation and its undo in the input gradient have no fast Triton path on sm_75 "
+                "(over its shared memory, or no tensor cores: the un-rotation epilogue alone takes 4-80x the "
+                "whole fp16 GEMM)",
+            ),
+            "sm80": Gate(
+                "explicit",
+                evidence = "A100 40GB, Unsloth LoRA r=16 on all linears, bs x 2048 tokens, 25 steps, fresh process "
+                "per run, interleaved: 1.045x / 1.109x / 1.156x bf16 step time at Qwen3-1.7B (bs 4) / 4B (bs 3) "
+                "/ 8B (bs 2), bf16 A/A 0.1-0.2% over 3 runs (1.7B is faster but under A/A + 5%); peak memory 8-21% lower. GEMMs alone (geomean): 1.5x "
+                "bf16 forward, 1.09x input gradient once Triton 3.8's prefetch split is skipped (forward 0.2x "
+                "before). Eval "
+                "loss after 100 steps at Qwen3-1.7B vs the bf16 mean (A/A 0.03%): +0.14% with the int8 forward, +0.05% "
+                "on the exact base. sm86 / sm87 (A10, RTX 30, Orin) share this gate untimed",
+            ),
+            "sm89": Gate(
+                "explicit",
+                evidence = "L4, same setup: 1.19x bf16 step time at Qwen3-1.7B (bs 4, bf16 A/A 4.9%) and 1.19x "
+                "at Qwen3-4B (bs 1, A/A 0.3%); an earlier VM gave 1.25x / 1.22x; Qwen3-8B does not fit 16-bit LoRA on "
+                "24 GB. GEMMs alone (geomean): 1.7x bf16 forward, 1.5x input gradient once Triton 3.8's "
+                "prefetch split is skipped (forward 0.3x before). Numerics are bit-identical to the A100 / sm120 kernels",
+            ),
+            "sm90": Gate("unprobed", "H100 is not available to test on"),
+            "sm100": Gate("unprobed", "B200: correctness only, never timed"),
+            "sm120": Gate(
+                "explicit",
+                evidence = "RTX 5090 (GeForce: FP32-accumulate bf16 / fp8 tensor paths run at half rate): "
+                "the int8 GEMM is 3.03x a bf16 GEMM and 1.54x fp8 tensorwise over a Qwen3-8B layer at 8192 "
+                "tokens (A/A 0.25%). RTX PRO 6000: int8 = fp8 rowwise = ~1.9x bf16 per GEMM. Eval loss after "
+                "100 LoRA steps vs bf16 (A/A 0.02-0.05%): +0.02% on the exact base, +0.16% with the int8 "
+                "forward at Qwen3-1.7B (fp8 rowwise: +0.10% / +0.42%)",
+            ),
+            "rocm": Gate(
+                "refused",
+                "the int8 kernels are CUDA Triton only; on gfx1151 (Radeon 8060S, ROCm 7.13, Triton 3.6) the best "
+                "int8 tiles over Qwen3 4B / 8B layers at 4k / 8k tokens are 0.94x bf16 for the forward and 0.80x "
+                "for the input gradient with the activation quantization (1.08x / 0.84x the GEMMs alone)",
+            ),
+        },
+        notes = "block-Hadamard (128) rotated per-token int8 activations and per-row int8 weight, int32 "
+        "accumulation, dequant and LoRA term in the GEMM epilogue; the input gradient reuses the same int8 "
+        "weight (row scale folded into dY, rotation undone in the epilogue); q / k / v and gate / up share "
+        "one activation quantization",
     )
 )
 
